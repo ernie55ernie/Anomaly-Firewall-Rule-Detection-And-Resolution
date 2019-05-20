@@ -237,18 +237,19 @@ class AnomalyResolver:
 			rule_1 = rule_tuple[1]
 			if rule_0.disjoint(rule_1):
 				continue
-			# if rule_0.issubset(rule_1) and rule_1.issubset(rule_1) and \
-			# 	rule_0.actions != rule_1.actions:
-			# 	self.resolver_logger.info('Correlation Anomaly\n\t%s\n\t%s', \
-			# 		str(rule_0), str(rule_1))
-			# 	continue
-			if rule_0.issubset(rule_1) or rule_1.issubset(rule_1):
+			if rule_0.issubset(rule_1) or rule_1.issubset(rule_0):
 				if rule_0.actions == rule_1.actions:
 					self.resolver_logger.info('Redundancy Anomaly\n\t%s\n\t%s', \
 						str(rule_0), str(rule_1))
 				else:
 					self.resolver_logger.info('Shadowing Anomaly\n\t%s\n\t%s', \
 						str(rule_0), str(rule_1))
+				continue
+			if not rule_0.disjoint(rule_1) and not rule_0.issubset(rule_1) and \
+				not rule_1.issubset(rule_0):
+				self.resolver_logger.info('Correlation Anomaly\n\t%s\n\t%s', \
+					str(rule_0), str(rule_1))
+				continue
 	
 	def resolve_anomalies(self, old_rules_list):
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \

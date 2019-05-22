@@ -4,7 +4,7 @@ import logging
 import logging.handlers
 import itertools
 import ctypes
-from netaddr import IPSet, IPRange, IPNetwork, iter_iprange, cidr_merge
+from netaddr import IPSet, IPRange, IPNetwork, cidr_merge
 
 STRING_TYPE = ctypes.c_wchar_p
 
@@ -177,26 +177,28 @@ class RULE(ctypes.Structure):
 			setattr(self, attribute, new_str)
 		else:
 			if offset == -1:
-				new_range = IPRange(start, end)[:-1]
+				new_range = IPRange(start, end - 1)
 			elif offset == 1:
-				new_range = IPRange(start, end)[1:]
+				new_range = IPRange(start + 1, end)
 			else:
 				new_range = IPRange(start, end)
 			new_range = self.iprange2str(new_range)
 			setattr(self, attribute, new_range)
 
 	def iprange2str(self, ip_range):
-		merged = cidr_merge(ip_range)
-		if len(merged) > 1:
-			return '%s-%s/32' % (str(merged[0][0]), str(merged[-1][-1]))
+		if len(ip_range) > 1:
+			return '%s-%s/32' % (str(ip_range[0]), str(ip_range[-1]))
 		else:
-			return str(merged[0])
+			return str(ip_range[0])
 
 	def ipstr2range(self, ip_str, format='range'):
+		if ip_str == '*' or ip_str.upper() == 'ANY':
+			ip_str = '0.0.0.0/0'
 		init = IPRange if format == 'range' else IPSet
 		if '-' in ip_str:
 			start, end = ip_str.split('-')
-			return init(start, end[:-3]) if format == 'range' else init(iter_iprange(start, end[:-3]))
+			iprange = IPRange(start, end[:-3])
+			return iprange if format == 'range' else init(iprange)
 		else:
 			if format == 'range':
 				network = IPNetwork(ip_str)
@@ -367,15 +369,15 @@ if __name__ == '__main__':
 	a = AnomalyResolver()
 	old_rules_list = list()
 	old_rules_list.append(RULE(priority = 1, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.110.96.0/24', tp_dst = '80', actions = 'DENY'))
+		tp_dst = '80', actions = 'DENY'))
 	old_rules_list.append(RULE(priority = 2, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-		nw_dst = '129.110.96.0/24', tp_dst = '80', actions = 'ALLOW'))
-	old_rules_list.append(RULE(priority = 3, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-		nw_dst = '129.110.96.80/32', tp_dst = '80', actions = 'ALLOW'))
+		tp_dst = '80', actions = 'ALLOW'))
+	old_rules_list.append(RULE(priority = 3, nw_proto = 'TCP', nw_dst = '129.110.96.80/32', \
+		tp_dst = '80', actions = 'ALLOW'))
 	old_rules_list.append(RULE(priority = 4, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
 		nw_dst = '129.110.96.80/32', tp_dst = '80', actions = 'DENY'))
 	old_rules_list.append(RULE(priority = 5, nw_proto = 'TCP', nw_src = '129.110.96.80/32', \
-		nw_dst = '129.110.96.0/24', tp_src = '22', actions = 'DENY' ,direction = 'out'))
+		tp_src = '22', actions = 'DENY' ,direction = 'out'))
 	old_rules_list.append(RULE(priority = 6, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
 		nw_dst = '129.96.96.80/32', tp_dst = '80', actions = 'DENY'))
 	old_rules_list.append(RULE(priority = 7, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
@@ -386,8 +388,8 @@ if __name__ == '__main__':
 		nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'ALLOW'))
 	old_rules_list.append(RULE(priority = 10, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
 		nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 11, nw_proto = 'UDP', nw_src = '129.110.96.0/24', \
-	    nw_dst = '129.110.96.0/24', actions = 'DENY' ,direction = 'out'))
+	old_rules_list.append(RULE(priority = 11, nw_proto = 'UDP', actions = 'DENY', \
+		direction = 'out'))
 
 	a.detect_anomalies(old_rules_list)
 	new_rules_list = a.resolve_anomalies(old_rules_list)

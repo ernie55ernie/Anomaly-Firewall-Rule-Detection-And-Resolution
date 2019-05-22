@@ -4,7 +4,7 @@ import logging
 import logging.handlers
 import itertools
 import ctypes
-from netaddr import IPNetwork, iter_iprange, cidr_merge
+from netaddr import IPSet, IPRange, IPNetwork, iter_iprange, cidr_merge
 
 STRING_TYPE = ctypes.c_wchar_p
 
@@ -129,8 +129,8 @@ class RULE(ctypes.Structure):
 		return res
 
 	def ipinrange(self, first, second):
-		first_set = set(self.ipstr2range(first))
-		second_set = set(self.ipstr2range(second))
+		first_set = self.ipstr2range(first, format='set')
+		second_set = self.ipstr2range(second, format='set')
 		return first_set.issubset(second_set)
 
 	def portdisjoint(self, first, second):
@@ -143,8 +143,8 @@ class RULE(ctypes.Structure):
 	def ipdisjoint(self, first, second):
 		if first == '0.0.0.0/0' or second == '0.0.0.0/0':
 			return False
-		first_set = set(self.ipstr2range(first))
-		second_set = set(self.ipstr2range(second))
+		first_set = self.ipstr2range(first, format='set')
+		second_set = self.ipstr2range(second, format='set')
 		return not first_set.intersection(second_set)
 
 	def find_attribute_set(self, subset_rule):
@@ -160,7 +160,7 @@ class RULE(ctypes.Structure):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
 			return self.portstr2range(getattr(self, attribute))
 		else:
-			return list(self.ipstr2range(getattr(self, attribute)))
+			return self.ipstr2range(getattr(self, attribute))
 
 	def set_attribute_range(self, attribute, start, end, offset):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
@@ -177,27 +177,31 @@ class RULE(ctypes.Structure):
 			setattr(self, attribute, new_str)
 		else:
 			if offset == -1:
-				new_range = list(iter_iprange(start, end))[:-1]
+				new_range = IPRange(start, end)[:-1]
 			elif offset == 1:
-				new_range = list(iter_iprange(start, end))[1:]
+				new_range = IPRange(start, end)[1:]
 			else:
-				new_range = list(iter_iprange(start, end))
+				new_range = IPRange(start, end)
 			new_range = self.iprange2str(new_range)
 			setattr(self, attribute, new_range)
 
 	def iprange2str(self, ip_range):
 		merged = cidr_merge(ip_range)
 		if len(merged) > 1:
-			return '%s-%s/32' % (str(ip_range[0]), str(ip_range[-1]))
+			return '%s-%s/32' % (str(merged[0][0]), str(merged[-1][-1]))
 		else:
 			return str(merged[0])
 
-	def ipstr2range(self, ip_str):
+	def ipstr2range(self, ip_str, format='range'):
+		init = IPRange if format == 'range' else IPSet
 		if '-' in ip_str:
 			start, end = ip_str.split('-')
-			return list(iter_iprange(start, end[:-3]))
+			return init(start, end[:-3]) if format == 'range' else init(iter_iprange(start, end[:-3]))
 		else:
-			return list(IPNetwork(ip_str))
+			if format == 'range':
+				network = IPNetwork(ip_str)
+				return init(network[0], network[-1])
+			return init([ip_str])
 
 	def set_fields(self, other):
 		for field in other._fields_:
@@ -386,5 +390,5 @@ if __name__ == '__main__':
 	    nw_dst = '129.110.96.0/24', actions = 'DENY' ,direction = 'out'))
 
 	a.detect_anomalies(old_rules_list)
-	# new_rules_list = a.resolve_anomalies(old_rules_list)
+	new_rules_list = a.resolve_anomalies(old_rules_list)
 	print('\n\n')

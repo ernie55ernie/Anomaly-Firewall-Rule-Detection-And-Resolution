@@ -6,6 +6,7 @@ import itertools
 import ctypes
 from netaddr import IPSet, IPRange, IPNetwork, IPGlob
 from netaddr import	cidr_merge, valid_ipv4, valid_glob, glob_to_cidrs
+import networkx as nx
 
 STRING_TYPE = ctypes.c_wchar_p
 
@@ -118,6 +119,11 @@ class Rule(ctypes.Structure):
 				return value
 			return '*' # 'ANY' or '*' or '0-65535':
 
+		if field == 'dl_type':
+			if value.upper() in ['ARP', 'IPv4', 'IPv6']:
+				return value.upper()
+			return 'IPv4'
+
 		if field == 'ipv4':
 			if '-' in value:
 				first, second = value.split('-')
@@ -129,6 +135,11 @@ class Rule(ctypes.Structure):
 				('/'in value and valid_ipv4(value[:value.find('/')])):
 				return value
 			return '*' # 'ANY'
+
+		if field == 'nw_proto':
+			if value.upper() in ['TCP', 'UDP', 'ICMP', 'ICMPv6']:
+				return value.upper()
+			return 'TCP'
 
 		if field == 'direction':
 			if value.upper() in ['IN']:
@@ -243,8 +254,10 @@ class Rule(ctypes.Structure):
 	def get_attribute_range(self, attribute):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
 			return self.portstr2range(getattr(self, attribute))
-		else:
+		elif attribute == 'nw_src' or attribute == 'nw_dst':
 			return self.ipstr2range(getattr(self, attribute))
+		else:
+			return eval('self.' + attribute)
 
 	def set_attribute_range(self, attribute, start, end, offset):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
@@ -299,7 +312,14 @@ class Rule(ctypes.Structure):
 
 class AnomalyResolver:
 
+	attr_list = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions']
+	attr_dict = {}
+	tree = None
+
 	def __init__(self, log_output = 'console', log_level = 'INFO'):
+
+		for key in self.attr_list:
+			self.attr_dict[key] = 0
 
 		self.resolver_logger = logging.getLogger('AnomalyResolver')
 		self.resolver_logger.setLevel(logging.DEBUG)
@@ -452,6 +472,25 @@ class AnomalyResolver:
 		rule.set_attribute_range(attribute, common_start, common_end, 0)
 		subset_rule.set_attribute_range(attribute, common_start, common_end, 0)
 		# TODO
+		
+	def tree_insert(self, node, rule):
+		tree = self.tree
+		attr_list = self.attr_list
+		attribute = nx.get_node_attributes(tree, 'attr')[node]
+		for snode in tree.successors(node):
+			edge_range = nx.get_edge_attributes(tree, 'range')[(node, snode)]
+			
+			if rule.get_attribute_range(attribute) == edge_range:
+				self.tree_insert(snode, rule)
+		idx = attr_list.index(attribute) + 1
+		if idx >= len(attr_list):
+			return
+		next_attribute = attr_list[idx]
+		self.attr_dict[next_attribute] = self.attr_dict[next_attribute] + 1
+		next_node = str(self.attr_dict[next_attribute]) + '. ' + next_attribute
+		tree.add_node(next_node, attr = next_attribute)
+		tree.add_edge(node, next_node, range = rule.get_attribute_range(attribute))
+		self.tree_insert(next_node, rule)
 
 if __name__ == '__main__':
 	srp = SimpleRuleParser('./rules/example_rules')
@@ -485,4 +524,15 @@ if __name__ == '__main__':
 
 	a.detect_anomalies(old_rules_list)
 	new_rules_list = a.resolve_anomalies(old_rules_list)
+	
+	# a.tree = nx.DiGraph()
+	# attr = a.attr_list[0]
+	# a.attr_dict[attr] = a.attr_dict[attr] + 1
+	# root_node = str(a.attr_dict[attr]) + '. ' + attr
+	# a.tree.add_node(root_node, attr = attr)
+	# for rule in old_rules_list:
+	# 	a.tree_insert(root_node, rule)
+	# print(a.tree.nodes())
+	# print(a.tree.edges())
+	
 	print('\n\n')

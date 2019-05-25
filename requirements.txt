@@ -1,1 +1,2 @@
 netaddr==0.7.19
+networkx==2.3

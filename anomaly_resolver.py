@@ -4,14 +4,48 @@ import logging
 import logging.handlers
 import itertools
 import ctypes
-from netaddr import IPSet, IPRange, IPNetwork, cidr_merge
+from netaddr import IPSet, IPRange, IPNetwork, IPGlob
+from netaddr import	cidr_merge, valid_ipv4, valid_glob, glob_to_cidrs
 
 STRING_TYPE = ctypes.c_wchar_p
 
 class RuleParser():
-	pass
 
-class RULE(ctypes.Structure):
+	rules = []
+	
+	def __init__(self):
+		pass
+
+	def parse_file(self, file_name):
+		pass
+
+	def get_rules(self):
+		return rules
+
+class SimpleRuleParser(RuleParser):
+
+	def __init__(self, file_name):
+		self.parse_file(file_name)
+		super(SimpleRuleParser, self).__init__()
+
+	def parse_file(self, file_name):
+		with open(file_name, 'r') as f:
+			for line in f:
+				rule_start = line.find('<')
+				rule_end = line.find('>')
+				rule_string = line[rule_start + 1:rule_end]
+				rule_string = rule_string.replace(' ', '')
+				fields = rule_string.split(',')
+				rule = Rule(direction = fields[0], 
+					nw_proto = fields[1], 
+					nw_src = fields[2], 
+					nw_dst = fields[4], 
+					tp_src = fields[3], 
+					tp_dst = fields[5], 
+					actions = fields[6])
+				self.rules.append(rule)
+
+class Rule(ctypes.Structure):
 	# https://osrg.github.io/ryu-book/en/html/rest_firewall.html#id10
 	_fields_ = [('switch', STRING_TYPE),
 	 			 # REST_SWITCHID, [ 'all' | Switch ID ]
@@ -48,20 +82,67 @@ class RULE(ctypes.Structure):
 				]
 
 	def __init__(self, switch = 'all', vlan = 'all', priority = 0, \
-		in_port = '0-65536', dl_src = '*', dl_dst = '*', \
+		in_port = '*', dl_src = '*', dl_dst = '*', \
 		dl_type = 'IPv4', nw_src = '*', nw_dst = '*', ipv6_src = '*', \
-		ipv6_dst = '*', nw_proto = 'TCP', tp_src = '0-65536', \
-		tp_dst = '0-65536',direction = 'IN', actions = 'DENY', id = 0, rule_id=0):
+		ipv6_dst = '*', nw_proto = 'TCP', tp_src = '0-65535', \
+		tp_dst = '*', direction = 'IN', actions = 'DENY', id = 0, rule_id=0):
 
-		super(RULE, self).__init__(switch, vlan, priority, RULE._portwildcard2range(in_port), \
+		priority = self._sanity_check(priority, field = 'priority')
+		in_port = self._sanity_check(in_port, field = 'port')
+		nw_src = self._sanity_check(nw_src, field = 'ipv4')
+		nw_dst = self._sanity_check(nw_dst, field = 'ipv4')
+		tp_src = self._sanity_check(tp_src, field = 'port')
+		tp_dst = self._sanity_check(tp_dst, field = 'port')
+		direction = self._sanity_check(direction, field = 'direction')
+		actions = self._sanity_check(actions, field = 'action')
+
+		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \
-			nw_proto, RULE._portwildcard2range(tp_src), RULE._portwildcard2range(tp_dst), \
+			nw_proto, tp_src, tp_dst, \
 			direction, actions)
 
-	def _portwildcard2range(port):
-		if port == '*':
-			return '0-65536'
-		return port
+	def _sanity_check(self, value, field):
+		if field == 'priority':
+			try:
+				if isinstance(value, int) and value >= 0 and value < 65536:
+					return value
+			except:
+				return value
+
+		if field == 'port':
+			if '-' in value and value != '0-65535':
+				first, second = value.split('-')
+				if first.isdigit() and second.isdigit():
+					return value
+			elif value.isdigit():
+				return value
+			return '*' # 'ANY' or '*' or '0-65535':
+
+		if field == 'ipv4':
+			if '-' in value:
+				first, second = value.split('-')
+				if valid_ipv4(first) and valid_ipv4(second):
+					return value
+			if valid_glob(value):
+				return str(glob_to_cidrs(value)[0])
+			if valid_ipv4(value) or \
+				('/'in value and valid_ipv4(value[:value.find('/')])):
+				return value
+			return '*' # 'ANY'
+
+		if field == 'direction':
+			if value.upper() in ['IN']:
+				return 'IN'
+			if value.upper() in ['OUT']:
+				return 'OUT'
+			return 'IN'
+
+		if field == 'action':
+			if value.upper() in ['DENY', 'REJECT']:
+				return 'DENY'
+			if value.upper() in ['ALLOW', 'ACCEPT']:
+				return 'ALLOW'
+			return 'DENY'
 
 	def __repr__(self, format='basic'):
 		if format == 'detail':
@@ -80,6 +161,9 @@ class RULE(ctypes.Structure):
 		return '<%s, %s, %s, %s, %s, %s, %s>' \
 			% (self.nw_src, self.nw_dst, \
 				self.nw_proto, self.tp_src, self.tp_dst, self.direction, self.actions)
+
+	def __eq__(self, rhs):
+		return self.issubset(rhs) and self.issubset(rhs)
 
 	def disjoint(self, subset_rule):
 		# TODO dl_src, dl_dst, dl_type not yet implemented
@@ -119,6 +203,8 @@ class RULE(ctypes.Structure):
 
 	def portstr2range(self, x):
 		res = list()
+		if x == '*':
+			x = '0-65535'
 		if '-' in x:
 			first, second = x.split('-')
 			first, second = int(first), int(second)
@@ -141,8 +227,6 @@ class RULE(ctypes.Structure):
 		return not first_set.intersection(second_set)
 
 	def ipdisjoint(self, first, second):
-		if first == '0.0.0.0/0' or second == '0.0.0.0/0':
-			return False
 		first_set = self.ipstr2range(first, format='set')
 		second_set = self.ipstr2range(second, format='set')
 		return not first_set.intersection(second_set)
@@ -192,9 +276,13 @@ class RULE(ctypes.Structure):
 			return str(ip_range[0])
 
 	def ipstr2range(self, ip_str, format='range'):
-		if ip_str == '*' or ip_str.upper() == 'ANY':
-			ip_str = '0.0.0.0/0'
 		init = IPRange if format == 'range' else IPSet
+		if ip_str == '*':
+			ip_str = '0.0.0.0/0'
+		if '*' in ip_str:
+			ipglob = IPGlob(ip_str)
+			iprange = IPRange(ipglob[0], ipglob[-1])
+			return iprange if format == 'range' else init(iprange)
 		if '-' in ip_str:
 			start, end = ip_str.split('-')
 			iprange = IPRange(start, end[:-3])
@@ -342,22 +430,22 @@ class AnomalyResolver:
 		common_end = min(rule_end, subset_rule_end)
 
 		if rule_start > subset_rule_start:
-			copy_rule = RULE()
+			copy_rule = Rule()
 			copy_rule.set_fields(subset_rule)
 			copy_rule.set_attribute_range(attribute, left, common_start, -1)
 			self.insert(copy_rule, new_rules_list)
 		elif rule_start < subset_rule_start:
-			copy_rule = RULE()
+			copy_rule = Rule()
 			copy_rule.set_fields(rule)
 			copy_rule.set_attribute_range(attribute, left, common_start, -1)
 			self.insert(copy_rule, new_rules_list)
 		if rule_end > subset_rule_end:
-			copy_rule = RULE()
+			copy_rule = Rule()
 			copy_rule.set_fields(rule)
 			copy_rule.set_attribute_range(attribute, common_end, right, 1)
 			self.insert(copy_rule, new_rules_list)
 		elif rule_end < subset_rule_end:
-			copy_rule = RULE()
+			copy_rule = Rule()
 			copy_rule.set_fields(subset_rule)
 			copy_rule.set_attribute_range(attribute, common_end, right, 1)
 			self.insert(copy_rule, new_rules_list)
@@ -366,30 +454,34 @@ class AnomalyResolver:
 		# TODO
 
 if __name__ == '__main__':
+	srp = SimpleRuleParser('./rules/example_rules')
+	old_rules_list = srp.rules
+	
+	# old_rules_list = list()
+	# old_rules_list.append(Rule(priority = 1, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
+	# 	tp_dst = '80', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 2, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
+	# 	tp_dst = '80', actions = 'ALLOW'))
+	# old_rules_list.append(Rule(priority = 3, nw_proto = 'TCP', nw_dst = '129.110.96.80/32', \
+	# 	tp_dst = '80', actions = 'ALLOW'))
+	# old_rules_list.append(Rule(priority = 4, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
+	# 	nw_dst = '129.110.96.80/32', tp_dst = '80', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 5, nw_proto = 'TCP', nw_src = '129.110.96.80/32', \
+	# 	tp_src = '22', actions = 'DENY' ,direction = 'OUT'))
+	# old_rules_list.append(Rule(priority = 6, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
+	# 	nw_dst = '129.110.96.80/32', tp_dst = '22', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 7, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
+	# 	nw_dst = '129.110.96.0/24', tp_dst = '22', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 8, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
+	# 	nw_dst = '129.110.96.80/32', tp_dst = '22', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 9, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
+	# 	nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'ALLOW'))
+	# old_rules_list.append(Rule(priority = 10, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
+	# 	nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'DENY'))
+	# old_rules_list.append(Rule(priority = 11, nw_proto = 'UDP', actions = 'DENY', \
+	# 	direction = 'OUT'))
+
 	a = AnomalyResolver()
-	old_rules_list = list()
-	old_rules_list.append(RULE(priority = 1, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
-		tp_dst = '80', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 2, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-		tp_dst = '80', actions = 'ALLOW'))
-	old_rules_list.append(RULE(priority = 3, nw_proto = 'TCP', nw_dst = '129.110.96.80/32', \
-		tp_dst = '80', actions = 'ALLOW'))
-	old_rules_list.append(RULE(priority = 4, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-		nw_dst = '129.110.96.80/32', tp_dst = '80', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 5, nw_proto = 'TCP', nw_src = '129.110.96.80/32', \
-		tp_src = '22', actions = 'DENY' ,direction = 'out'))
-	old_rules_list.append(RULE(priority = 6, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.96.96.80/32', tp_dst = '80', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 7, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.110.96.0/24', tp_dst = '22', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 8, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.110.96.80/32', tp_dst = '22', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 9, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'ALLOW'))
-	old_rules_list.append(RULE(priority = 10, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-		nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'DENY'))
-	old_rules_list.append(RULE(priority = 11, nw_proto = 'UDP', actions = 'DENY', \
-		direction = 'out'))
 
 	a.detect_anomalies(old_rules_list)
 	new_rules_list = a.resolve_anomalies(old_rules_list)

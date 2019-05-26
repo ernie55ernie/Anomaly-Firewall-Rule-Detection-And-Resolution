@@ -7,6 +7,10 @@ import ctypes
 from netaddr import IPSet, IPRange, IPNetwork, IPGlob
 from netaddr import	cidr_merge, valid_ipv4, valid_glob, glob_to_cidrs
 import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from utils import hierarchy_pos
 
 STRING_TYPE = ctypes.c_wchar_p
 
@@ -32,12 +36,14 @@ class SimpleRuleParser(RuleParser):
 	def parse_file(self, file_name):
 		with open(file_name, 'r') as f:
 			for line in f:
+				priority = int(line[:line.find('.')])
 				rule_start = line.find('<')
 				rule_end = line.find('>')
 				rule_string = line[rule_start + 1:rule_end]
 				rule_string = rule_string.replace(' ', '')
 				fields = rule_string.split(',')
-				rule = Rule(direction = fields[0], 
+				rule = Rule(priority = priority,
+					direction = fields[0], 
 					nw_proto = fields[1], 
 					nw_src = fields[2], 
 					nw_dst = fields[4], 
@@ -251,11 +257,18 @@ class Rule(ctypes.Structure):
 				attribute_set.add(field[0])
 		return attribute_set
 
-	def get_attribute_range(self, attribute):
+	def get_attribute_range(self, attribute, format = 'range'):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
-			return self.portstr2range(getattr(self, attribute))
+			range_list = self.portstr2range(getattr(self, attribute))
+			if format == 'string':
+				return '%d-%d' % (range_list[0], range_list[-1])
+			return range_list
 		elif attribute == 'nw_src' or attribute == 'nw_dst':
-			return self.ipstr2range(getattr(self, attribute))
+			iprange = self.ipstr2range(getattr(self, attribute))
+			if format == 'string':
+				last = str(iprange[-1])
+				return str(iprange[0]) + '-' + last[last.rindex('.'):]
+			return iprange
 		else:
 			return eval('self.' + attribute)
 
@@ -298,7 +311,7 @@ class Rule(ctypes.Structure):
 			return iprange if format == 'range' else init(iprange)
 		if '-' in ip_str:
 			start, end = ip_str.split('-')
-			iprange = IPRange(start, end[:-3])
+			iprange = IPRange(start, start[:start.rindex('.') + 1] + end)
 			return iprange if format == 'range' else init(iprange)
 		else:
 			if format == 'range':
@@ -312,7 +325,7 @@ class Rule(ctypes.Structure):
 
 class AnomalyResolver:
 
-	attr_list = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions']
+	attr_list = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions', 'None']
 	attr_dict = {}
 	tree = None
 
@@ -366,6 +379,9 @@ class AnomalyResolver:
 				continue
 	
 	def resolve_anomalies(self, old_rules_list):
+		'''
+		Resolve anomalies in firewall rules file
+		'''
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \
 			'\n\t'.join(map(str, old_rules_list)))
 		new_rules_list = list()
@@ -396,21 +412,26 @@ class AnomalyResolver:
 
 
 	def insert(self, rule, new_rules_list):
+		'''
+		Insert the rule r into new_rules_list
+		'''
 		if not new_rules_list:
-			new_rules_list.append(rule)
+			new_rules_list.append(r)
 		else:
 			inserted = False
 			for subset_rule in new_rules_list:
 
-				if not rule.disjoint(subset_rule):
-					inserted = self.resolve(rule, subset_rule, new_rules_list)
+				if not r.disjoint(subset_rule):
+					inserted = self.resolve(r, subset_rule, new_rules_list)
 					if inserted:
 						break
 			if not inserted:
-				new_rules_list.append(rule)
+				new_rules_list.append(r)
 
 	def resolve(self, rule, subset_rule, new_rules_list):
-
+		'''
+		Resolve anomalies between two rules r and s
+		'''
 		if rule.issubset(subset_rule) and subset_rule.issubset(rule):
 			if not rule.actions == subset_rule.actions:
 				subset_rule.actions = 'DENY'
@@ -436,6 +457,9 @@ class AnomalyResolver:
 		return True
 
 	def split(self, rule, subset_rule, attribute, new_rules_list):
+		'''
+		Split overlapping rules r and s based on attribute a
+		'''
 		self.resolver_logger.info('Correlation rule %s, %s' % (str(rule), str(subset_rule)))
 		rule_range = rule.get_attribute_range(attribute)
 		rule_start = rule_range[0]
@@ -473,66 +497,87 @@ class AnomalyResolver:
 		subset_rule.set_attribute_range(attribute, common_start, common_end, 0)
 		# TODO
 		
+	def construct_rule_tree(self, rule_list, plot=True):
+		'''
+		'''
+		self.tree = nx.DiGraph()
+		attr = self.attr_list[0]
+		self.attr_dict[attr] = self.attr_dict[attr] + 1
+		root_node = str(self.attr_dict[attr]) + '. ' + attr
+		self.tree.add_node(root_node, attr = attr)
+		for rule in rule_list:
+			self.tree_insert(root_node, rule)
+		if plot:
+			self.plot_firewall_rule_tree()
+		print('Nodes', self.tree.nodes())
+		print('Edges', self.tree.edges())
+
+	def plot_firewall_rule_tree(self, file_name = 'firewall_rule_tree.png'):
+		plt.figure(figsize = (16, 16))
+		tree = self.tree
+		pos = hierarchy_pos(tree)
+		nx.draw(tree, pos, with_labels = True)
+		nx.draw_networkx_edge_labels(tree, 
+			pos, 
+			rotate = False,
+			edge_labels = nx.get_edge_attributes(tree, 'range'))
+		plt.savefig(file_name)
+
 	def tree_insert(self, node, rule):
+		'''
+		Inserts rule r into the node n of the rule tree
+		'''
 		tree = self.tree
 		attr_list = self.attr_list
-		attribute = nx.get_node_attributes(tree, 'attr')[node]
+		attr_dict = self.attr_dict
+		attr = nx.get_node_attributes(tree, 'attr')[node]
 		for snode in tree.successors(node):
 			edge_range = nx.get_edge_attributes(tree, 'range')[(node, snode)]
 			
-			if rule.get_attribute_range(attribute) == edge_range:
+			if rule.get_attribute_range(attr, format = 'string') == edge_range:
 				self.tree_insert(snode, rule)
-		idx = attr_list.index(attribute) + 1
-		if idx >= len(attr_list):
+				return
+		idx = attr_list.index(attr) + 1 if attr in attr_list else len(attr_list) + 1
+		if idx > len(attr_list):
 			return
-		next_attribute = attr_list[idx]
-		self.attr_dict[next_attribute] = self.attr_dict[next_attribute] + 1
-		next_node = str(self.attr_dict[next_attribute]) + '. ' + next_attribute
-		tree.add_node(next_node, attr = next_attribute)
-		tree.add_edge(node, next_node, range = rule.get_attribute_range(attribute))
+		else:
+			next_attr = attr_list[idx]
+			attr_dict[next_attr] = attr_dict[next_attr] + 1
+			next_node = str(attr_dict[next_attr]) + ('. ' + next_attr if next_attr != 'None' else '')
+		tree.add_node(next_node, attr = next_attr)
+		tree.add_edge(node, next_node, range = rule.get_attribute_range(attr, format = 'string'))
+		if next_attr == 'None':
+			return
 		self.tree_insert(next_node, rule)
 
+	def merge(n):
+		'''
+		Merges edges of node n representing a continuous range
+		for all edge e in n.edges:
+			merge(e.node)
+		for all dege e in n.edges:
+			for all edge e' != e in n.edges:
+				if e and e' range are contiguous and Subtree(e)=Subtree(e'):
+					Merge e.range and e'.range into e.range
+					Remove e' from n.edges
+		'''
+		pass
+
 if __name__ == '__main__':
-	srp = SimpleRuleParser('./rules/example_rules')
-	old_rules_list = srp.rules
-	
-	# old_rules_list = list()
-	# old_rules_list.append(Rule(priority = 1, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
-	# 	tp_dst = '80', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 2, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-	# 	tp_dst = '80', actions = 'ALLOW'))
-	# old_rules_list.append(Rule(priority = 3, nw_proto = 'TCP', nw_dst = '129.110.96.80/32', \
-	# 	tp_dst = '80', actions = 'ALLOW'))
-	# old_rules_list.append(Rule(priority = 4, nw_proto = 'TCP', nw_src = '129.110.96.0/24', \
-	# 	nw_dst = '129.110.96.80/32', tp_dst = '80', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 5, nw_proto = 'TCP', nw_src = '129.110.96.80/32', \
-	# 	tp_src = '22', actions = 'DENY' ,direction = 'OUT'))
-	# old_rules_list.append(Rule(priority = 6, nw_proto = 'TCP', nw_src = '129.110.96.117/32', \
-	# 	nw_dst = '129.110.96.80/32', tp_dst = '22', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 7, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-	# 	nw_dst = '129.110.96.0/24', tp_dst = '22', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 8, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-	# 	nw_dst = '129.110.96.80/32', tp_dst = '22', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 9, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-	# 	nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'ALLOW'))
-	# old_rules_list.append(Rule(priority = 10, nw_proto = 'UDP', nw_src = '129.110.96.117/32', \
-	# 	nw_dst = '129.110.96.117/32', tp_dst = '22', actions = 'DENY'))
-	# old_rules_list.append(Rule(priority = 11, nw_proto = 'UDP', actions = 'DENY', \
-	# 	direction = 'OUT'))
 
-	a = AnomalyResolver()
+	# usage of detection and resolving
+	# srp = SimpleRuleParser('./rules/example_rules_1')
+	# old_rules_list = srp.rules
 
-	a.detect_anomalies(old_rules_list)
-	new_rules_list = a.resolve_anomalies(old_rules_list)
+	# a = AnomalyResolver()
+
+	# a.detect_anomalies(old_rules_list)
+	# new_rules_list = a.resolve_anomalies(old_rules_list)
+
+	# usage of merging rules
+	srp = SimpleRuleParser('./rules/example_rules_2')
+	rules_list = srp.rules
 	
-	# a.tree = nx.DiGraph()
-	# attr = a.attr_list[0]
-	# a.attr_dict[attr] = a.attr_dict[attr] + 1
-	# root_node = str(a.attr_dict[attr]) + '. ' + attr
-	# a.tree.add_node(root_node, attr = attr)
-	# for rule in old_rules_list:
-	# 	a.tree_insert(root_node, rule)
-	# print(a.tree.nodes())
-	# print(a.tree.edges())
+	a.construct_rule_tree(rules_list)
 	
 	print('\n\n')

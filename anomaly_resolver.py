@@ -15,23 +15,18 @@ from utils import hierarchy_pos
 STRING_TYPE = ctypes.c_wchar_p
 
 class RuleParser():
-
-	rules = []
 	
 	def __init__(self):
-		pass
+		self.rules = []
 
 	def parse_file(self, file_name):
 		pass
 
-	def get_rules(self):
-		return self.rules
-
 class SimpleRuleParser(RuleParser):
 
 	def __init__(self, file_name):
-		self.parse_file(file_name)
 		super(SimpleRuleParser, self).__init__()
+		self.parse_file(file_name)
 
 	def parse_file(self, file_name):
 		with open(file_name, 'r') as f:
@@ -136,10 +131,10 @@ class Rule(ctypes.Structure):
 				if valid_ipv4(first) and valid_ipv4(second):
 					return value
 			if valid_glob(value):
-				return str(glob_to_cidrs(value)[0])
+				return str(glob_to_cidrs(value)[0]).replace('/32', '')
 			if valid_ipv4(value) or \
 				('/'in value and valid_ipv4(value[:value.find('/')])):
-				return value
+				return value.replace('/32', '')
 			return '*' # 'ANY'
 
 		if field == 'nw_proto':
@@ -229,6 +224,11 @@ class Rule(ctypes.Structure):
 			res.append(num)
 		return res
 
+	def portrange2str(x):
+		if len(x) > 1:
+			return '%d-%d' % (x[0], x[-1])
+		return str(x[0])
+
 	def ipinrange(first, second):
 		first_set = Rule.ipstr2range(first, format='set')
 		second_set = Rule.ipstr2range(second, format='set')
@@ -259,9 +259,7 @@ class Rule(ctypes.Structure):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
 			range_list = Rule.portstr2range(getattr(self, attribute))
 			if format == 'string':
-				if len(range_list) < 2:
-					return str(range_list[0])
-				return '%d-%d' % (range_list[0], range_list[-1])
+				return Rule.portrange2str(range(range_list[0], range_list[-1] + 1))
 			return range_list
 		elif attribute == 'nw_src' or attribute == 'nw_dst':
 			iprange = Rule.ipstr2range(getattr(self, attribute))
@@ -297,7 +295,8 @@ class Rule(ctypes.Structure):
 
 	def iprange2str(ip_range):
 		if len(ip_range) > 1:
-			return '%s-%s/32' % (str(ip_range[0]), str(ip_range[-1]))
+			end = str(ip_range[-1])
+			return '%s-%s' % (str(ip_range[0]), end[end.rindex('.') + 1:])
 		else:
 			return str(ip_range[0])
 
@@ -327,9 +326,25 @@ class Rule(ctypes.Structure):
 		if '.' in r_1 or '*' == r_1:
 			range_1 = Rule.ipstr2range(r_1)
 			range_2 = Rule.ipstr2range(r_2)
+
 		else:
 			range_1 = Rule.portstr2range(r_1)
 			range_2 = Rule.portstr2range(r_2)
+		if range_1[-1] + 1 == range_2[0] or \
+			range_1[0] == range_2[-1] + 1:
+			return True
+		return False
+
+	def combine_range(r_1, r_2):
+		if '.' in r_1 or '*' == r_1:
+			range_1 = Rule.ipstr2range(r_1)
+			range_2 = Rule.ipstr2range(r_2)
+			return Rule.iprange2str(IPRange(range_1[0], range_2[-1]))
+		else:
+			range_1 = Rule.portstr2range(r_1)
+			range_2 = Rule.portstr2range(r_2)
+			return Rule.portrange2str(range(range_1[0], range_2[-1] + 1))
+		return None
 
 class AnomalyResolver:
 
@@ -421,7 +436,7 @@ class AnomalyResolver:
 		return new_rules_list
 
 
-	def insert(self, rule, new_rules_list):
+	def insert(self, r, new_rules_list):
 		'''
 		Insert the rule r into new_rules_list
 		'''
@@ -509,6 +524,7 @@ class AnomalyResolver:
 	def merge_contiguous_rules(self, rule_list):
 		self.construct_rule_tree(rule_list)
 		self.merge(self.get_rule_tree_root())
+		self.plot_firewall_rule_tree(file_name = 'merged_tree.png')
 		
 	def construct_rule_tree(self, rule_list, plot=True):
 		'''
@@ -554,12 +570,12 @@ class AnomalyResolver:
 		attr = nx.get_node_attributes(tree, 'attr')[node]
 		for snode in tree.successors(node):
 			edge_range = nx.get_edge_attributes(tree, 'range')[(node, snode)]
-			
+			print(rule.get_attribute_range(attr, format = 'string'), edge_range)
 			if rule.get_attribute_range(attr, format = 'string') == edge_range:
 				self.tree_insert(snode, rule)
 				return
-		idx = attr_list.index(attr) + 1 if attr in attr_list else len(attr_list) + 1
-		if idx > len(attr_list):
+		idx = attr_list.index(attr) + 1
+		if idx >= len(attr_list):
 			return
 		else:
 			next_attr = attr_list[idx]
@@ -584,10 +600,11 @@ class AnomalyResolver:
 		'''
 		tree = self.tree
 		edges = tree.edges()
-		print(tree.edges([n]))
 		for e in tree.edges([n]):
 			self.merge(e[1])
 		combination_list = list(itertools.combinations(tree.edges([n]), 2))
+		self.removing_edges = []
+		self.removing_nodes = []
 		for edge_tuple in combination_list:
 			edge_1 = edge_tuple[0]
 			edge_2 = edge_tuple[1]
@@ -595,28 +612,52 @@ class AnomalyResolver:
 			range_2 = edges[edge_2]['range']
 			if Rule.contiguous(range_1, range_2) \
 				and self.subtree_equal(edge_1, edge_2):
-				pass
+				result = Rule.combine_range(range_1, range_2)
+				nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
+				self.cut_edge(edge_2)
+		tree.remove_edges_from(self.removing_edges)
+		tree.remove_nodes_from(self.removing_nodes)
+
+	def cut_edge(self, edge):
+		'''
+		'''
+		tree = self.tree
+		self.removing_edges.append((edge[0], edge[1]))
+		for e in tree.edges([edge[1]]):
+			self.cut_edge(e)
+		self.removing_nodes.append(edge[1])
 
 	def subtree_equal(self, e_1, e_2):
 		'''
 		'''
-		pass
+		tree = self.tree
+		edges = tree.edges()
+		edges_1 = tree.edges([e_1[1]])
+		edges_2 = tree.edges([e_2[1]])
+		if len(edges_1) != len(edges_2):
+			return False
+		sign = True
+		for edge_1, edge_2 in zip(edges_1, edges_2):
+			if edges[edge_1]['range'] != edges[edge_2]['range'] or not sign:
+				return False
+			sign = self.subtree_equal(edge_1, edge_2)
+		return sign
 
 if __name__ == '__main__':
 
 	# usage of detection and resolving
-	# srp = SimpleRuleParser('./rules/example_rules_1')
-	# old_rules_list = srp.rules
+	srp = SimpleRuleParser('./rules/example_rules_1')
+	old_rules_list = srp.rules
 
 	a = AnomalyResolver()
-
-	# a.detect_anomalies(old_rules_list)
-	# new_rules_list = a.resolve_anomalies(old_rules_list)
+	a.detect_anomalies(old_rules_list)
+	new_rules_list = a.resolve_anomalies(old_rules_list)
 
 	# usage of merging rules
 	srp = SimpleRuleParser('./rules/example_rules_2')
-	rules_list = srp.get_rules()
-	
-	print(a.merge_contiguous_rules(rules_list))
+	rules_list = srp.rules
+
+	a = AnomalyResolver()
+	a.merge_contiguous_rules(rules_list)
 	
 	print('\n\n')

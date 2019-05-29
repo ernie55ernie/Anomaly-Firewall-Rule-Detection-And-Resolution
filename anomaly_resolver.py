@@ -25,7 +25,7 @@ class RuleParser():
 		pass
 
 	def get_rules(self):
-		return rules
+		return self.rules
 
 class SimpleRuleParser(RuleParser):
 
@@ -94,21 +94,21 @@ class Rule(ctypes.Structure):
 		ipv6_dst = '*', nw_proto = 'TCP', tp_src = '0-65535', \
 		tp_dst = '*', direction = 'IN', actions = 'DENY', id = 0, rule_id=0):
 
-		priority = self._sanity_check(priority, field = 'priority')
-		in_port = self._sanity_check(in_port, field = 'port')
-		nw_src = self._sanity_check(nw_src, field = 'ipv4')
-		nw_dst = self._sanity_check(nw_dst, field = 'ipv4')
-		tp_src = self._sanity_check(tp_src, field = 'port')
-		tp_dst = self._sanity_check(tp_dst, field = 'port')
-		direction = self._sanity_check(direction, field = 'direction')
-		actions = self._sanity_check(actions, field = 'action')
+		priority = Rule._sanity_check(priority, field = 'priority')
+		in_port = Rule._sanity_check(in_port, field = 'port')
+		nw_src = Rule._sanity_check(nw_src, field = 'ipv4')
+		nw_dst = Rule._sanity_check(nw_dst, field = 'ipv4')
+		tp_src = Rule._sanity_check(tp_src, field = 'port')
+		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
+		direction = Rule._sanity_check(direction, field = 'direction')
+		actions = Rule._sanity_check(actions, field = 'action')
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \
 			nw_proto, tp_src, tp_dst, \
 			direction, actions)
 
-	def _sanity_check(self, value, field):
+	def _sanity_check(value, field):
 		if field == 'priority':
 			try:
 				if isinstance(value, int) and value >= 0 and value < 65536:
@@ -183,42 +183,40 @@ class Rule(ctypes.Structure):
 		return self.issubset(rhs) and self.issubset(rhs)
 
 	def disjoint(self, subset_rule):
-		# TODO dl_src, dl_dst, dl_type not yet implemented
-		# TODO ipv6_src, ipv6_dst not yet implemented
-		# TODO multiple protocol
+		# TODO support for
+		# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
 		if not self.switch == subset_rule.switch or \
 			not self.vlan == subset_rule.vlan or \
-			self.portdisjoint(self.in_port, subset_rule.in_port) or \
-			self.ipdisjoint(self.nw_src, subset_rule.nw_src) or \
-			self.ipdisjoint(self.nw_dst, subset_rule.nw_dst) or \
+			Rule.portdisjoint(self.in_port, subset_rule.in_port) or \
+			Rule.ipdisjoint(self.nw_src, subset_rule.nw_src) or \
+			Rule.ipdisjoint(self.nw_dst, subset_rule.nw_dst) or \
 			not self.nw_proto == subset_rule.nw_proto or \
-			self.portdisjoint(self.tp_src, subset_rule.tp_src) or \
-			self.portdisjoint(self.tp_dst, subset_rule.tp_dst) or \
+			Rule.portdisjoint(self.tp_src, subset_rule.tp_src) or \
+			Rule.portdisjoint(self.tp_dst, subset_rule.tp_dst) or \
 			not self.direction == subset_rule.direction:
 			return True
 		return False
 
 	def issubset(self, subset_rule):
-		# TODO dl_src, dl_dst, dl_type not yet implemented
-		# TODO ipv6_src, ipv6_dst not yet implemented
-		# TODO multiple protocol
+		# TODO support for
+		# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
 		if self.switch == subset_rule.switch and self.vlan == subset_rule.vlan and \
-			self.portinrange(self.in_port, subset_rule.in_port) and \
-			self.ipinrange(self.nw_src, subset_rule.nw_src) and \
-			self.ipinrange(self.nw_dst, subset_rule.nw_dst) and \
+			Rule.portinrange(self.in_port, subset_rule.in_port) and \
+			Rule.ipinrange(self.nw_src, subset_rule.nw_src) and \
+			Rule.ipinrange(self.nw_dst, subset_rule.nw_dst) and \
 			self.nw_proto == subset_rule.nw_proto and \
-			self.portinrange(self.tp_src, subset_rule.tp_src) and \
-			self.portinrange(self.tp_dst, subset_rule.tp_dst) and \
+			Rule.portinrange(self.tp_src, subset_rule.tp_src) and \
+			Rule.portinrange(self.tp_dst, subset_rule.tp_dst) and \
 			self.direction == subset_rule.direction:
 			return True
 		return False
 
-	def portinrange(self, first, second):
-		first_set = set(self.portstr2range(first))
-		second_set = set(self.portstr2range(second))
+	def portinrange(first, second):
+		first_set = set(Rule.portstr2range(first))
+		second_set = set(Rule.portstr2range(second))
 		return first_set.issubset(second_set)
 
-	def portstr2range(self, x):
+	def portstr2range(x):
 		res = list()
 		if x == '*':
 			x = '0-65535'
@@ -231,21 +229,21 @@ class Rule(ctypes.Structure):
 			res.append(num)
 		return res
 
-	def ipinrange(self, first, second):
-		first_set = self.ipstr2range(first, format='set')
-		second_set = self.ipstr2range(second, format='set')
+	def ipinrange(first, second):
+		first_set = Rule.ipstr2range(first, format='set')
+		second_set = Rule.ipstr2range(second, format='set')
 		return first_set.issubset(second_set)
 
-	def portdisjoint(self, first, second):
+	def portdisjoint(first, second):
 		if first == '0-65535' or second == '0-65535':
 			return False
-		first_set = set(self.portstr2range(first))
-		second_set = set(self.portstr2range(second))
+		first_set = set(Rule.portstr2range(first))
+		second_set = set(Rule.portstr2range(second))
 		return not first_set.intersection(second_set)
 
-	def ipdisjoint(self, first, second):
-		first_set = self.ipstr2range(first, format='set')
-		second_set = self.ipstr2range(second, format='set')
+	def ipdisjoint(first, second):
+		first_set = Rule.ipstr2range(first, format='set')
+		second_set = Rule.ipstr2range(second, format='set')
 		return not first_set.intersection(second_set)
 
 	def find_attribute_set(self, subset_rule):
@@ -259,15 +257,17 @@ class Rule(ctypes.Structure):
 
 	def get_attribute_range(self, attribute, format = 'range'):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
-			range_list = self.portstr2range(getattr(self, attribute))
+			range_list = Rule.portstr2range(getattr(self, attribute))
 			if format == 'string':
+				if len(range_list) < 2:
+					return str(range_list[0])
 				return '%d-%d' % (range_list[0], range_list[-1])
 			return range_list
 		elif attribute == 'nw_src' or attribute == 'nw_dst':
-			iprange = self.ipstr2range(getattr(self, attribute))
+			iprange = Rule.ipstr2range(getattr(self, attribute))
 			if format == 'string':
 				last = str(iprange[-1])
-				return str(iprange[0]) + '-' + last[last.rindex('.'):]
+				return str(iprange[0]) + '-' + last[last.rindex('.') + 1:]
 			return iprange
 		else:
 			return eval('self.' + attribute)
@@ -292,16 +292,16 @@ class Rule(ctypes.Structure):
 				new_range = IPRange(start + 1, end)
 			else:
 				new_range = IPRange(start, end)
-			new_range = self.iprange2str(new_range)
+			new_range = Rule.iprange2str(new_range)
 			setattr(self, attribute, new_range)
 
-	def iprange2str(self, ip_range):
+	def iprange2str(ip_range):
 		if len(ip_range) > 1:
 			return '%s-%s/32' % (str(ip_range[0]), str(ip_range[-1]))
 		else:
 			return str(ip_range[0])
 
-	def ipstr2range(self, ip_str, format='range'):
+	def ipstr2range(ip_str, format='range'):
 		init = IPRange if format == 'range' else IPSet
 		if ip_str == '*':
 			ip_str = '0.0.0.0/0'
@@ -323,8 +323,18 @@ class Rule(ctypes.Structure):
 		for field in other._fields_:
 			setattr(self, field[0], getattr(other, field[0]))
 
+	def contiguous(r_1, r_2):
+		if '.' in r_1 or '*' == r_1:
+			range_1 = Rule.ipstr2range(r_1)
+			range_2 = Rule.ipstr2range(r_2)
+		else:
+			range_1 = Rule.portstr2range(r_1)
+			range_2 = Rule.portstr2range(r_2)
+
 class AnomalyResolver:
 
+	# TODO support for
+	# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
 	attr_list = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions', 'None']
 	attr_dict = {}
 	tree = None
@@ -404,7 +414,7 @@ class AnomalyResolver:
 					new_rules_list.remove(rule)
 					removed_rules.append(rule)
 		# TODO reassign priority
-
+		
 		self.resolver_logger.info('New rules list:\n\t' + \
 			'\n\t'.join(map(str, new_rules_list)))
 		self.resolver_logger.info('Finish anomalies resolving')
@@ -495,7 +505,10 @@ class AnomalyResolver:
 			self.insert(copy_rule, new_rules_list)
 		rule.set_attribute_range(attribute, common_start, common_end, 0)
 		subset_rule.set_attribute_range(attribute, common_start, common_end, 0)
-		# TODO
+	
+	def merge_contiguous_rules(self, rule_list):
+		self.construct_rule_tree(rule_list)
+		self.merge(self.get_rule_tree_root())
 		
 	def construct_rule_tree(self, rule_list, plot=True):
 		'''
@@ -511,6 +524,14 @@ class AnomalyResolver:
 			self.plot_firewall_rule_tree()
 		print('Nodes', self.tree.nodes())
 		print('Edges', self.tree.edges())
+
+	def get_rule_tree_root(self):
+		'''
+		'''
+		attr_list = self.attr_list
+		if self.tree:
+			return '1. ' + attr_list[0]
+		return None
 
 	def plot_firewall_rule_tree(self, file_name = 'firewall_rule_tree.png'):
 		plt.figure(figsize = (16, 16))
@@ -550,16 +571,34 @@ class AnomalyResolver:
 			return
 		self.tree_insert(next_node, rule)
 
-	def merge(n):
+	def merge(self, n):
 		'''
 		Merges edges of node n representing a continuous range
 		for all edge e in n.edges:
 			merge(e.node)
-		for all dege e in n.edges:
+		for all edge e in n.edges:
 			for all edge e' != e in n.edges:
 				if e and e' range are contiguous and Subtree(e)=Subtree(e'):
 					Merge e.range and e'.range into e.range
 					Remove e' from n.edges
+		'''
+		tree = self.tree
+		edges = tree.edges()
+		print(tree.edges([n]))
+		for e in tree.edges([n]):
+			self.merge(e[1])
+		combination_list = list(itertools.combinations(tree.edges([n]), 2))
+		for edge_tuple in combination_list:
+			edge_1 = edge_tuple[0]
+			edge_2 = edge_tuple[1]
+			range_1 = edges[edge_1]['range']
+			range_2 = edges[edge_2]['range']
+			if Rule.contiguous(range_1, range_2) \
+				and self.subtree_equal(edge_1, edge_2):
+				pass
+
+	def subtree_equal(self, e_1, e_2):
+		'''
 		'''
 		pass
 
@@ -569,15 +608,15 @@ if __name__ == '__main__':
 	# srp = SimpleRuleParser('./rules/example_rules_1')
 	# old_rules_list = srp.rules
 
-	# a = AnomalyResolver()
+	a = AnomalyResolver()
 
 	# a.detect_anomalies(old_rules_list)
 	# new_rules_list = a.resolve_anomalies(old_rules_list)
 
 	# usage of merging rules
 	srp = SimpleRuleParser('./rules/example_rules_2')
-	rules_list = srp.rules
+	rules_list = srp.get_rules()
 	
-	a.construct_rule_tree(rules_list)
+	print(a.merge_contiguous_rules(rules_list))
 	
 	print('\n\n')

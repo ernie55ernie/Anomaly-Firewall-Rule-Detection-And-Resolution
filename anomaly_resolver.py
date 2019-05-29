@@ -257,16 +257,13 @@ class Rule(ctypes.Structure):
 
 	def get_attribute_range(self, attribute, format = 'range'):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
-			range_list = Rule.portstr2range(getattr(self, attribute))
 			if format == 'string':
-				return Rule.portrange2str(range(range_list[0], range_list[-1] + 1))
-			return range_list
+				return getattr(self, attribute)
+			return Rule.portstr2range(getattr(self, attribute))
 		elif attribute == 'nw_src' or attribute == 'nw_dst':
-			iprange = Rule.ipstr2range(getattr(self, attribute))
 			if format == 'string':
-				last = str(iprange[-1])
-				return str(iprange[0]) + '-' + last[last.rindex('.') + 1:]
-			return iprange
+				return getattr(self, attribute)
+			return Rule.ipstr2range(getattr(self, attribute))
 		else:
 			return eval('self.' + attribute)
 
@@ -323,15 +320,18 @@ class Rule(ctypes.Structure):
 			setattr(self, field[0], getattr(other, field[0]))
 
 	def contiguous(r_1, r_2):
+		range_value = False
 		if '.' in r_1 or '*' == r_1:
 			range_1 = Rule.ipstr2range(r_1)
 			range_2 = Rule.ipstr2range(r_2)
-
-		else:
+			range_value = True
+		elif r_1.isdigit() or '-' in r_1:
 			range_1 = Rule.portstr2range(r_1)
 			range_2 = Rule.portstr2range(r_2)
-		if range_1[-1] + 1 == range_2[0] or \
-			range_1[0] == range_2[-1] + 1:
+			range_value = True
+		if (range_1[-1] + 1 == range_2[0] or \
+			range_1[0] == range_2[-1] + 1) and \
+			range_value:
 			return True
 		return False
 
@@ -570,7 +570,6 @@ class AnomalyResolver:
 		attr = nx.get_node_attributes(tree, 'attr')[node]
 		for snode in tree.successors(node):
 			edge_range = nx.get_edge_attributes(tree, 'range')[(node, snode)]
-			print(rule.get_attribute_range(attr, format = 'string'), edge_range)
 			if rule.get_attribute_range(attr, format = 'string') == edge_range:
 				self.tree_insert(snode, rule)
 				return
@@ -615,8 +614,10 @@ class AnomalyResolver:
 				result = Rule.combine_range(range_1, range_2)
 				nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
 				self.cut_edge(edge_2)
-		tree.remove_edges_from(self.removing_edges)
-		tree.remove_nodes_from(self.removing_nodes)
+			tree.remove_edges_from(self.removing_edges)
+			tree.remove_nodes_from(self.removing_nodes)
+			self.removing_edges = []
+			self.removing_nodes = []
 
 	def cut_edge(self, edge):
 		'''

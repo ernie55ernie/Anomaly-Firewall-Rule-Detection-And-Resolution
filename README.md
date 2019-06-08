@@ -3,9 +3,39 @@ This is an implementation of the [paper](https://link.springer.com/chapter/10.10
 
 Firewall rules define the security policy for network traffic. Any error can compromise the system security by letting unwanted traffic pass or blocking desired traffic.
 
-A rule is defined as a set of criteria and an action to perform when a packet matches a criteria. The criteria of a [Ryu restful firewall rule]((https://osrg.github.io/ryu-book/en/html/rest_firewall.html#id10)) consist of the elements VLAN, priority, input switch port, Ethernet source, Ethernet destination, Ethernet frame type, IP source, IP destination, IPv6 source, IPv6 destination, IP protocol, source port, and destination port. These are also the matching fields defined in [OpenFlow Switch Specification](https://www.opennetworking.org/wp-content/uploads/2014/10/openflow-spec-v1.3.0.pdf).
+## Usage
+```
+usage: main.py [-h] [--path PATH] [--detect] [--resolve] [--merge]
+
+Anomaly Firewall Rule Detection and Resolution
+
+optional arguments:
+  -h, --help   show this help message and exit
+  --path PATH  path of firewall rules file
+  --detect     detect anomaly firewall rule
+  --resolve    resolve anomaly firewall rule
+  --merge      merge contiguous firewall rule
+```
+- This will run the demo program
+```
+python anomaly_resolver.py
+```
+- This will perform anomaly detection
+```
+python main.py --path rules/example_rules_1 --detect
+```
+- This will perform anomaly resolving
+```
+python main.py --path rules/example_rules_1 --resolve
+```
+- This will perform rule merging
+```
+python main.py --path rules/example_rules_2 --merge
+```
 
 ## Relation Between Two Rules
+
+A rule is defined as a set of criteria and an action to perform when a packet matches a criteria. The criteria of a [Ryu restful firewall rule]((https://osrg.github.io/ryu-book/en/html/rest_firewall.html#id10)) consist of the elements VLAN, priority, input switch port, Ethernet source, Ethernet destination, Ethernet frame type, IP source, IP destination, IPv6 source, IPv6 destination, IP protocol, source port, and destination port. These are also the matching fields defined in [OpenFlow Switch Specification](https://www.opennetworking.org/wp-content/uploads/2014/10/openflow-spec-v1.3.0.pdf).
 
 The relation between two rules is the relation between the set of packets they match. Assume a rule matches A packets and the other matches B packets.
 

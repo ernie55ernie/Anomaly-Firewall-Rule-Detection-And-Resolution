@@ -49,6 +49,7 @@ class SimpleRuleParser(RuleParser):
 
 class Rule(ctypes.Structure):
 	# https://osrg.github.io/ryu-book/en/html/rest_firewall.html#id10
+	# https://www.opennetworking.org/wp-content/uploads/2014/10/openflow-spec-v1.3.0.pdf
 	_fields_ = [('switch', STRING_TYPE),
 	 			 # REST_SWITCHID, [ 'all' | Switch ID ]
 				('vlan', STRING_TYPE),
@@ -128,8 +129,10 @@ class Rule(ctypes.Structure):
 		if field == 'ipv4':
 			if '-' in value:
 				first, second = value.split('-')
+				if second.isdigit():
+					second = first[:first.rindex('.') + 1] + second
 				if valid_ipv4(first) and valid_ipv4(second):
-					return value
+					return first + '-' + second
 			if valid_glob(value):
 				return str(glob_to_cidrs(value)[0]).replace('/32', '')
 			if valid_ipv4(value) or \
@@ -171,8 +174,8 @@ class Rule(ctypes.Structure):
 					self.dl_dst, self.dl_type, self.nw_src, self.nw_dst, self.ipv6_src, \
 					self.ipv6_dst, self.nw_proto, self.tp_src, self.tp_dst, self.actions)
 		return '<%s, %s, %s, %s, %s, %s, %s>' \
-			% (self.nw_src, self.nw_dst, \
-				self.nw_proto, self.tp_src, self.tp_dst, self.direction, self.actions)
+			% (self.direction, self.nw_proto, self.nw_src, self.tp_src, \
+				self.nw_dst, self.tp_dst, self.actions)
 
 	def __eq__(self, rhs):
 		return self.issubset(rhs) and self.issubset(rhs)
@@ -293,7 +296,7 @@ class Rule(ctypes.Structure):
 	def iprange2str(ip_range):
 		if len(ip_range) > 1:
 			end = str(ip_range[-1])
-			return '%s-%s' % (str(ip_range[0]), end[end.rindex('.') + 1:])
+			return '%s-%s' % (str(ip_range[0]), end) # end[end.rindex('.') + 1:]
 		else:
 			return str(ip_range[0])
 
@@ -307,7 +310,7 @@ class Rule(ctypes.Structure):
 			return iprange if format == 'range' else init(iprange)
 		if '-' in ip_str:
 			start, end = ip_str.split('-')
-			iprange = IPRange(start, start[:start.rindex('.') + 1] + end)
+			iprange = IPRange(start, end) # start[:start.rindex('.') + 1] + 
 			return iprange if format == 'range' else init(iprange)
 		else:
 			if format == 'range':
@@ -398,7 +401,7 @@ class AnomalyResolver:
 						str(rule_0), str(rule_1))
 				continue
 			if not rule_0.disjoint(rule_1) and not rule_0.issubset(rule_1) and \
-				not rule_1.issubset(rule_0):
+				not rule_1.issubset(rule_0) and rule_0.actions != rule_1.actions:
 				self.resolver_logger.info('Correlation Anomaly\n\t%s\n\t%s', \
 					str(rule_0), str(rule_1))
 				continue
@@ -485,7 +488,7 @@ class AnomalyResolver:
 		'''
 		Split overlapping rules r and s based on attribute a
 		'''
-		self.resolver_logger.info('Correlation rule %s, %s' % (str(rule), str(subset_rule)))
+		self.resolver_logger.info('Overlapping rule %s, %s' % (str(rule), str(subset_rule)))
 		rule_range = rule.get_attribute_range(attribute)
 		rule_start = rule_range[0]
 		rule_end = rule_range[-1]
@@ -524,7 +527,7 @@ class AnomalyResolver:
 	def merge_contiguous_rules(self, rule_list):
 		self.construct_rule_tree(rule_list)
 		self.merge(self.get_rule_tree_root())
-		self.plot_firewall_rule_tree(file_name = 'merged_tree.png')
+		self.plot_firewall_rule_tree(file_name = 'img/merged_tree.png')
 		
 	def construct_rule_tree(self, rule_list, plot=True):
 		'''
@@ -549,7 +552,7 @@ class AnomalyResolver:
 			return '1. ' + attr_list[0]
 		return None
 
-	def plot_firewall_rule_tree(self, file_name = 'firewall_rule_tree.png'):
+	def plot_firewall_rule_tree(self, file_name = 'img/firewall_rule_tree.png'):
 		plt.figure(figsize = (16, 16))
 		tree = self.tree
 		pos = hierarchy_pos(tree)

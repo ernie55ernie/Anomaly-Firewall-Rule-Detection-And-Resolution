@@ -3,6 +3,14 @@ This is an implementation of the [paper](https://link.springer.com/chapter/10.10
 
 Firewall rules define the security policy for network traffic. Any error can compromise the system security by letting unwanted traffic pass or blocking desired traffic.
 
+- [Usage](#usage)
+- [Relation Between Two Rules](#relation-between-two-rules)
+- [Possible Anomalies Between Two Rules](#possible-anomalies-between-two-rules)
+- [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm)
+- [Illustrative Example of the Merge Algorithm](#illustrative-example-of-the-merge-algorithm)
+- [Task List](#task-list)
+- [More about this program](#more-about-this-program)
+
 ## Usage
 ```
 usage: main.py [-h] [--path PATH] [--detect] [--resolve] [--merge]
@@ -15,6 +23,10 @@ optional arguments:
   --detect     detect anomaly firewall rule
   --resolve    resolve anomaly firewall rule
   --merge      merge contiguous firewall rule
+```
+- Install dependency
+```
+pip install -r requirements.txt
 ```
 - This will run the demo program
 ```
@@ -43,8 +55,8 @@ The relation between two rules is the relation between the set of packets they m
 
 1. Disjoint: at least one criterion in the rules has completely disjoint values
 2. Exactly Matching: every criterion in the rules match exactly
-3. Inclusivly Matching: a rule and the other rule have at least one criterion which is a subset of one another and for the rest of the attribute one is equal to the other
-4. Correlated: two rules are not disjoint and not inclusivly matching to one another
+3. Inclusively Matching: a rule and the other rule have at least one criterion which is a subset of one another and for the rest of the attribute one is equal to the other
+4. Correlated: two rules are not disjoint and not inclusively matching to one another
 
 ## Possible Anomalies Between Two Rules
 
@@ -53,14 +65,14 @@ The relation between two rules is the relation between the set of packets they m
 3. Redundancy Anomaly: a redundant rule performs the same action on the same packets as another rule
 
 This algorithm resolves the anomalies as follows:
-- *shadowing anoamly*: When rules are *exactly matched*, keep the one with the reject action. When the rules are *inclusivly matched*, reorder the one with the reject action.
+- *shadowing anoamly*: When rules are *exactly matched*, keep the one with the reject action. When the rules are *inclusively matched*, reorder the one with the reject action.
 - *correlation anomaly*: Break down the rules into disjoint parts and insert them into the list. Of the part that is common to the correlated rules, keep the one with the reject action.
 - *redundancy anomaly*: Remove the redundant rule.
 
-## Illustrative Example
+## Illustrative Example of the Resolve Algorithm
 
 Firewall rules are expected in the following format: 
-- priority. <direction, nw_src, tp_src, nw_dst, tp_dst, actions>
+- priority. <direction, source IP, source port, destination IP, destination port, actions>
 ```
 1. <IN, TCP, 129.110.96.117, ANY, ANY, 80, REJECT>
 2. <IN, TCP, 129.110.96.*, ANY, ANY, 80, ACCEPT>
@@ -115,3 +127,6 @@ On this tree, the merge function is run and the result of the merged tree:
 - [ ] IP range representation to multiple CIDR representations
 - [ ] Support for handling dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple nw_proto
 - [ ] Output resolved and merged rules to firewall rules file
+
+### More about this program
+Detailed descrptions about this program is in this blog post [Anomaly Firewall Rule Detection and Resolution](https://ernie55ernie.github.io/python/2019/06/09/anomaly-firewall-rule-detection-and-resolution.html).

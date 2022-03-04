@@ -178,7 +178,7 @@ class Rule(ctypes.Structure):
 				self.nw_dst, self.tp_dst, self.actions)
 
 	def __eq__(self, rhs):
-		return self.issubset(rhs) and self.issubset(rhs)
+		return self.issubset(rhs) and rhs.issubset(self)
 
 	def disjoint(self, subset_rule):
 		# TODO support for

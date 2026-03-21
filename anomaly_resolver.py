@@ -1,15 +1,15 @@
 # Firewall Rule Anomaly Resolver for Ryu restfull firewall 
 # https://github.com/osrg/ryu/blob/master/ryu/app/rest_firewall.py
-import logging
-import logging.handlers
-import itertools
 import ctypes
+import itertools
+import logging
+import os
+import tempfile
+
 from netaddr import IPSet, IPRange, IPNetwork, IPGlob
-from netaddr import	cidr_merge, valid_ipv4, valid_glob, glob_to_cidrs
+from netaddr import valid_ipv4, valid_glob, glob_to_cidrs
 import networkx as nx
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+
 from utils import hierarchy_pos
 
 STRING_TYPE = ctypes.c_wchar_p
@@ -29,14 +29,31 @@ class SimpleRuleParser(RuleParser):
 		self.parse_file(file_name)
 
 	def parse_file(self, file_name):
-		with open(file_name, 'r') as f:
-			for line in f:
-				priority = int(line[:line.find('.')])
+		with open(file_name, 'r', encoding='utf-8') as f:
+			for line_number, raw_line in enumerate(f, start=1):
+				line = raw_line.strip()
+				if not line or line.startswith('#'):
+					continue
+				if '.' not in line or '<' not in line or '>' not in line:
+					raise ValueError(
+						'Invalid rule format on line %d: %s' % (line_number, raw_line.rstrip())
+					)
+				try:
+					priority = int(line[:line.find('.')].strip())
+				except ValueError as exc:
+					raise ValueError(
+						'Invalid priority on line %d: %s' % (line_number, raw_line.rstrip())
+					) from exc
 				rule_start = line.find('<')
 				rule_end = line.find('>')
 				rule_string = line[rule_start + 1:rule_end]
 				rule_string = rule_string.replace(' ', '')
 				fields = rule_string.split(',')
+				if len(fields) != 7:
+					raise ValueError(
+						'Expected 7 rule fields on line %d, got %d: %s'
+						% (line_number, len(fields), raw_line.rstrip())
+					)
 				rule = Rule(priority = priority,
 					direction = fields[0], 
 					nw_proto = fields[1], 
@@ -92,8 +109,10 @@ class Rule(ctypes.Structure):
 
 		priority = Rule._sanity_check(priority, field = 'priority')
 		in_port = Rule._sanity_check(in_port, field = 'port')
+		dl_type = Rule._sanity_check(dl_type, field = 'dl_type')
 		nw_src = Rule._sanity_check(nw_src, field = 'ipv4')
 		nw_dst = Rule._sanity_check(nw_dst, field = 'ipv4')
+		nw_proto = Rule._sanity_check(nw_proto, field = 'nw_proto')
 		tp_src = Rule._sanity_check(tp_src, field = 'port')
 		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
 		direction = Rule._sanity_check(direction, field = 'direction')
@@ -163,7 +182,7 @@ class Rule(ctypes.Structure):
 		if format == 'detail':
 			return '<switch:%s, vlan:%s, priority:%d, in_port:%s, dl_src:%s, dl_dst:%s,' \
 					' dl_type:%s, nw_src:%s, nw_dst:%s, ipv6_src:%s, ipv6_dst:%s,' \
-					' nw_proto:%s, tp_src:%s, tp_dst:%s, actions:%s>' \
+					' nw_proto:%s, tp_src:%s, tp_dst:%s, direction:%s, actions:%s>' \
 					% (self.switch, self.vlan, self.priority, self.in_port, \
 						self.dl_src, self.dl_dst, self.dl_type, self.nw_src, self.nw_dst, \
 						self.ipv6_src, self.ipv6_dst, self.nw_proto, self.tp_src, \
@@ -268,7 +287,7 @@ class Rule(ctypes.Structure):
 				return getattr(self, attribute)
 			return Rule.ipstr2range(getattr(self, attribute))
 		else:
-			return eval('self.' + attribute)
+			return getattr(self, attribute)
 
 	def set_attribute_range(self, attribute, start, end, offset):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':
@@ -322,31 +341,43 @@ class Rule(ctypes.Structure):
 		for field in other._fields_:
 			setattr(self, field[0], getattr(other, field[0]))
 
-	def contiguous(r_1, r_2):
-		range_value = False
-		if '.' in r_1 or '*' == r_1:
-			range_1 = Rule.ipstr2range(r_1)
-			range_2 = Rule.ipstr2range(r_2)
-			range_value = True
-		elif r_1.isdigit() or '-' in r_1:
-			range_1 = Rule.portstr2range(r_1)
-			range_2 = Rule.portstr2range(r_2)
-			range_value = True
-		if (range_1[-1] + 1 == range_2[0] or \
-			range_1[0] == range_2[-1] + 1) and \
-			range_value:
-			return True
-		return False
+	def _range_type(attribute, r_1, r_2):
+		if attribute in ['nw_src', 'nw_dst']:
+			return 'ip'
+		if attribute in ['in_port', 'tp_src', 'tp_dst']:
+			return 'port'
+		if '.' in r_1 or '.' in r_2:
+			return 'ip'
+		if all(value == '*' or value.isdigit() or '-' in value for value in [r_1, r_2]):
+			return 'port'
+		return None
 
-	def combine_range(r_1, r_2):
-		if '.' in r_1 or '*' == r_1:
+	def contiguous(r_1, r_2, attribute=None):
+		range_type = Rule._range_type(attribute, r_1, r_2)
+		if range_type == 'ip':
 			range_1 = Rule.ipstr2range(r_1)
 			range_2 = Rule.ipstr2range(r_2)
-			return Rule.iprange2str(IPRange(range_1[0], range_2[-1]))
-		else:
+		elif range_type == 'port':
 			range_1 = Rule.portstr2range(r_1)
 			range_2 = Rule.portstr2range(r_2)
-			return Rule.portrange2str(range(range_1[0], range_2[-1] + 1))
+		else:
+			return False
+		return range_1[-1] + 1 == range_2[0] or range_1[0] == range_2[-1] + 1
+
+	def combine_range(r_1, r_2, attribute=None):
+		range_type = Rule._range_type(attribute, r_1, r_2)
+		if range_type == 'ip':
+			range_1 = Rule.ipstr2range(r_1)
+			range_2 = Rule.ipstr2range(r_2)
+			return Rule.iprange2str(
+				IPRange(min(range_1[0], range_2[0]), max(range_1[-1], range_2[-1]))
+			)
+		if range_type == 'port':
+			range_1 = Rule.portstr2range(r_1)
+			range_2 = Rule.portstr2range(r_2)
+			return Rule.portrange2str(
+				range(min(range_1[0], range_2[0]), max(range_1[-1], range_2[-1]) + 1)
+			)
 		return None
 
 class AnomalyResolver:
@@ -359,16 +390,18 @@ class AnomalyResolver:
 
 	def __init__(self, log_output = 'console', log_level = 'INFO'):
 
-		for key in self.attr_list:
-			self.attr_dict[key] = 0
+		self.attr_dict = {key: 0 for key in self.attr_list}
+		self.tree = None
 
-		self.resolver_logger = logging.getLogger('AnomalyResolver')
+		self.resolver_logger = logging.getLogger('AnomalyResolver.%s' % id(self))
+		self.resolver_logger.propagate = False
 		self.resolver_logger.setLevel(logging.DEBUG)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s' \
 			' - %(message)s')
+		log_level = str(log_level).upper()
 		if log_level not in ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG', 'NOTSET']:
 			log_level = 'INFO'
-		log_level = eval('logging.' + log_level)
+		log_level = getattr(logging, log_level)
 		if 'file' in log_output:
 			self.LOG_FILENAME = 'anomaly_resolver.log'
 			file_handler = logging.FileHandler(self.LOG_FILENAME)
@@ -469,7 +502,8 @@ class AnomalyResolver:
 		if rule.issubset(subset_rule):
 			self.resolver_logger.info('Reodering %s before %s' % \
 				(str(rule), str(subset_rule)))
-			new_rules_list.insert(0, rule)
+			insert_idx = new_rules_list.index(subset_rule)
+			new_rules_list.insert(insert_idx, rule)
 			return True
 		if subset_rule.issubset(rule):
 			return False
@@ -532,6 +566,7 @@ class AnomalyResolver:
 	def construct_rule_tree(self, rule_list, plot=True):
 		'''
 		'''
+		self.attr_dict = {key: 0 for key in self.attr_list}
 		self.tree = nx.DiGraph()
 		attr = self.attr_list[0]
 		self.attr_dict[attr] = self.attr_dict[attr] + 1
@@ -541,8 +576,8 @@ class AnomalyResolver:
 			self.tree_insert(root_node, rule)
 		if plot:
 			self.plot_firewall_rule_tree()
-		print('Nodes', self.tree.nodes())
-		print('Edges', self.tree.edges())
+		self.resolver_logger.debug('Nodes %s', list(self.tree.nodes()))
+		self.resolver_logger.debug('Edges %s', list(self.tree.edges()))
 
 	def get_rule_tree_root(self):
 		'''
@@ -553,7 +588,19 @@ class AnomalyResolver:
 		return None
 
 	def plot_firewall_rule_tree(self, file_name = 'img/firewall_rule_tree.png'):
-		plt.figure(figsize = (16, 16))
+		mpl_config_dir = os.path.join(tempfile.gettempdir(), 'anomaly-resolver-mpl')
+		os.makedirs(mpl_config_dir, exist_ok=True)
+		os.environ.setdefault('MPLCONFIGDIR', mpl_config_dir)
+
+		import matplotlib
+		matplotlib.use('Agg')
+		import matplotlib.pyplot as plt
+
+		output_dir = os.path.dirname(file_name)
+		if output_dir:
+			os.makedirs(output_dir, exist_ok=True)
+
+		figure = plt.figure(figsize = (16, 16))
 		tree = self.tree
 		pos = hierarchy_pos(tree)
 		nx.draw(tree, pos, with_labels = True)
@@ -561,7 +608,8 @@ class AnomalyResolver:
 			pos, 
 			rotate = False,
 			edge_labels = nx.get_edge_attributes(tree, 'range'))
-		plt.savefig(file_name)
+		figure.savefig(file_name)
+		plt.close(figure)
 
 	def tree_insert(self, node, rule):
 		'''
@@ -602,6 +650,7 @@ class AnomalyResolver:
 		'''
 		tree = self.tree
 		edges = tree.edges()
+		attribute = tree.nodes[n]['attr']
 		for e in tree.edges([n]):
 			self.merge(e[1])
 		combination_list = list(itertools.combinations(tree.edges([n]), 2))
@@ -612,9 +661,9 @@ class AnomalyResolver:
 			edge_2 = edge_tuple[1]
 			range_1 = edges[edge_1]['range']
 			range_2 = edges[edge_2]['range']
-			if Rule.contiguous(range_1, range_2) \
+			if Rule.contiguous(range_1, range_2, attribute=attribute) \
 				and self.subtree_equal(edge_1, edge_2):
-				result = Rule.combine_range(range_1, range_2)
+				result = Rule.combine_range(range_1, range_2, attribute=attribute)
 				nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
 				self.cut_edge(edge_2)
 			tree.remove_edges_from(self.removing_edges)
@@ -636,16 +685,18 @@ class AnomalyResolver:
 		'''
 		tree = self.tree
 		edges = tree.edges()
-		edges_1 = tree.edges([e_1[1]])
-		edges_2 = tree.edges([e_2[1]])
+		edges_1 = list(tree.edges([e_1[1]]))
+		edges_2 = list(tree.edges([e_2[1]]))
 		if len(edges_1) != len(edges_2):
 			return False
-		sign = True
-		for edge_1, edge_2 in zip(edges_1, edges_2):
-			if edges[edge_1]['range'] != edges[edge_2]['range'] or not sign:
+		children_1 = {edges[edge]['range']: edge for edge in edges_1}
+		children_2 = {edges[edge]['range']: edge for edge in edges_2}
+		if set(children_1.keys()) != set(children_2.keys()):
+			return False
+		for edge_range, child_edge in children_1.items():
+			if not self.subtree_equal(child_edge, children_2[edge_range]):
 				return False
-			sign = self.subtree_equal(edge_1, edge_2)
-		return sign
+		return True
 
 if __name__ == '__main__':
 

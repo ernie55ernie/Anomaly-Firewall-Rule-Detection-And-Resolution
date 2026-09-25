@@ -57,6 +57,72 @@ class ResolverTests(unittest.TestCase):
 		self.assertEqual(len(second.resolver_logger.handlers), 1)
 
 
+class DetectionTests(unittest.TestCase):
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def redundancies(self, rules):
+		with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+			self.resolver.detect_anomalies(rules)
+		return [record.getMessage().split('\n\t')[1:] for record in logs.records
+			if record.getMessage().startswith('Redundancy Anomaly')]
+
+	def test_rule_needed_by_a_rule_in_between_is_not_redundant(self):
+		# Issue #2: removing the host rule would let the subnet ALLOW decide.
+		rules = [Rule(nw_src='10.0.0.1', tp_dst='80', actions='DENY'),
+			Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='*', tp_dst='80', actions='DENY')]
+		self.assertEqual(self.redundancies(rules), [])
+
+	def test_rule_covered_by_a_later_rule_with_the_same_action_is_redundant(self):
+		host = Rule(nw_src='10.0.0.1', tp_dst='80', actions='DENY')
+		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='DENY')
+		self.assertEqual(self.redundancies([host, subnet]), [[str(host), str(subnet)]])
+
+	def test_later_rule_inside_an_earlier_rule_with_the_same_action_is_redundant(self):
+		# The host rule never matches, whatever lies in between.
+		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='DENY')
+		everyone = Rule(nw_src='*', tp_dst='80', actions='ALLOW')
+		host = Rule(nw_src='10.0.0.1', tp_dst='80', actions='DENY')
+		self.assertEqual(self.redundancies([subnet, everyone, host]),
+			[[str(subnet), str(host)]])
+
+
+class ResolveTests(unittest.TestCase):
+	# insert() never builds a list with two rules covering the same packets, but
+	# resolve() must not rely on that: Rule.__eq__ ignores the action.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def test_rule_is_reordered_right_before_the_rule_containing_it(self):
+		twin = Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='ALLOW')
+		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='DENY')
+		host = Rule(nw_src='10.0.0.1', tp_dst='80', actions='ALLOW')
+		rules = [twin, subnet]
+		self.assertTrue(self.resolver.resolve(host, subnet, rules))
+		self.assertEqual(len(rules), 3)
+		self.assertIs(rules[0], twin)
+		self.assertIs(rules[1], host)
+		self.assertIs(rules[2], subnet)
+
+	def test_correlated_rule_replaces_the_rule_it_overlaps(self):
+		twin = Rule(nw_src='10.0.0.0/24', tp_dst='80-90', actions='ALLOW')
+		existing = Rule(nw_src='10.0.0.0/24', tp_dst='80-90', actions='DENY')
+		overlapping = Rule(nw_src='10.0.0.0/24', tp_dst='85-100', actions='DENY')
+		rules = [twin, existing]
+		self.assertTrue(self.resolver.resolve(overlapping, existing, rules))
+		self.assertEqual(sum(rule is twin for rule in rules), 1)
+		self.assertEqual(sum(rule is existing for rule in rules), 1)
+
+
 class RedundancyRemovalTests(unittest.TestCase):
 
 	def setUp(self):

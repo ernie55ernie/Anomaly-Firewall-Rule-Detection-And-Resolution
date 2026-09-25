@@ -162,6 +162,14 @@ class RedundancyRemovalTests(unittest.TestCase):
 		self.assertIs(kept[0], subnet)
 		self.assertIs(kept[1], everyone)
 
+	def test_rule_with_an_empty_range_is_removed(self):
+		# A reversed port range matches nothing, so removing the rule is safe.
+		empty = Rule(nw_src='10.0.0.1', tp_dst='80-20', actions='DENY')
+		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='1-100', actions='DENY')
+		kept = self.resolver.remove_redundant_rules([empty, subnet])
+		self.assertEqual(len(kept), 1)
+		self.assertIs(kept[0], subnet)
+
 	def test_disjoint_and_same_action_rules_before_the_container_are_skipped(self):
 		host = Rule(nw_src='10.0.0.1', tp_dst='80-81', actions='DENY')
 		other_host = Rule(nw_src='10.0.0.9', tp_dst='80', actions='ALLOW')

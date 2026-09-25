@@ -482,7 +482,8 @@ class AnomalyResolver:
 			self.resolver_logger.info('Redundant rule %s', str(rule))
 		return kept_rules[::-1]
 
-	def redundant(self, rule, later_rules):
+	@staticmethod
+	def redundant(rule, later_rules):
 		'''
 		Whether the first later rule that contains rule has the same action,
 		with no overlapping rule of a different action before it
@@ -490,13 +491,16 @@ class AnomalyResolver:
 		# Stop at the first later rule that contains rule, as in the paper. An
 		# overlapping rule with a different action before it would take over
 		# some of rule's packets. The check is conservative: a rule covered only
-		# by several later rules together is kept.
+		# by several later rules together is kept. Only containment matters for
+		# a later rule with the same action, and any overlap for one with a
+		# different action, so each later rule needs a single check. A rule with
+		# an empty range, which matches nothing, is removed once a later rule
+		# shares its action.
 		for later_rule in later_rules:
-			if rule.disjoint(later_rule):
-				continue
-			if rule.issubset(later_rule):
-				return rule.actions == later_rule.actions
-			if rule.actions != later_rule.actions:
+			if rule.actions == later_rule.actions:
+				if rule.issubset(later_rule):
+					return True
+			elif not rule.disjoint(later_rule):
 				return False
 		return False
 
@@ -548,7 +552,8 @@ class AnomalyResolver:
 		self.insert(subset_rule, new_rules_list)
 		return True
 
-	def position(self, rules_list, rule):
+	@staticmethod
+	def position(rules_list, rule):
 		'''
 		Index of rule in rules_list, compared by identity
 		'''

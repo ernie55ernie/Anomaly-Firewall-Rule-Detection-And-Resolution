@@ -151,7 +151,7 @@ Fixed since the audit:
   - A glob such as `10.0.1-2.*` is cut down to its first /24.
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
-- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Detection, resolution, splitting, merging and input checking have no tests.
+- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Only the redundancy-removal step of resolution is tested; detection, the insert and split steps of resolution, merging and input checking have no tests.
 - The resolved list in [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm) is out of date and contains shadowing anomalies itself. [Possible Anomalies Between Two Rules](#possible-anomalies-between-two-rules) says inclusive matches "reorder the one with the reject action", but the code moves the more specific rule first whatever its action.
 
 ### Low

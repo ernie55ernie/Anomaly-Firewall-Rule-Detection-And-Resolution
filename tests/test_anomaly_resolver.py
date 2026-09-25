@@ -1,3 +1,4 @@
+import itertools
 import os
 import random
 import tempfile
@@ -61,6 +62,11 @@ class RedundancyRemovalTests(unittest.TestCase):
 	def setUp(self):
 		self.resolver = AnomalyResolver(log_level='CRITICAL')
 
+	def tearDown(self):
+		# The logger outlives the resolver. Drop its handler so a later resolver
+		# that reuses the same id does not end up with two.
+		self.resolver.resolver_logger.handlers.clear()
+
 	def test_deny_exception_before_broader_allow_is_kept(self):
 		# Issue #2: the host rule is not redundant with the last rule, because
 		# the subnet ALLOW in between would take over its packets.
@@ -121,36 +127,70 @@ class RedundancyRemovalTests(unittest.TestCase):
 			['Redundant rule %s' % host, 'Redundant rule %s' % subnet])
 
 	def test_removal_never_changes_a_decision(self):
-		# Explicit in_port and tp_src values keep the port checks small.
+		# Random policies over a small space, checked against every packet in it
+		# with plain integer ranges rather than Rule.issubset. Most ranges span
+		# the whole space and most rules share a direction and protocol, so rules
+		# often contain one another. Explicit in_port values keep the port checks
+		# small.
 		generator = random.Random(2)
 
-		def address_range():
-			first = generator.randrange(8)
-			last = generator.randrange(first, 8)
-			if first == 0 and last == 7:
-				return '*'
-			if first == last:
-				return '10.0.0.%d' % first
-			return '10.0.0.%d-10.0.0.%d' % (first, last)
+		def bounds(low, high):
+			if generator.random() < 0.6:
+				return low, high
+			first = generator.randrange(low, high + 1)
+			return first, generator.randrange(first, high + 1)
 
-		def port_range():
-			first = generator.randrange(1, 5)
-			last = generator.randrange(first, 5)
-			return str(first) if first == last else '%d-%d' % (first, last)
+		def address(prefix, low, high):
+			if generator.random() < 0.2:
+				return '*', (0, 255)
+			first, last = bounds(low, high)
+			if first == last:
+				return '%s.%d' % (prefix, first), (first, last)
+			return '%s.%d-%s.%d' % (prefix, first, prefix, last), (first, last)
+
+		def port(low, high):
+			first, last = bounds(low, high)
+			return (str(first) if first == last else '%d-%d' % (first, last)), (first, last)
 
 		def random_rule():
-			return Rule(in_port='1', nw_src=address_range(), tp_src='1',
-				tp_dst=port_range(), actions=generator.choice(['ALLOW', 'DENY']))
+			nw_src, nw_src_bounds = address('10.0.0', 0, 4)
+			nw_dst, nw_dst_bounds = address('10.0.1', 0, 2)
+			tp_src, tp_src_bounds = port(1, 2)
+			tp_dst, tp_dst_bounds = port(1, 3)
+			fields = {'direction': generator.choice(['IN', 'IN', 'IN', 'OUT']),
+				'nw_proto': generator.choice(['TCP', 'TCP', 'TCP', 'UDP']),
+				'nw_src': nw_src_bounds, 'nw_dst': nw_dst_bounds,
+				'tp_src': tp_src_bounds, 'tp_dst': tp_dst_bounds,
+				'actions': generator.choice(['ALLOW', 'DENY'])}
+			rule = Rule(in_port='1', direction=fields['direction'],
+				nw_proto=fields['nw_proto'], nw_src=nw_src, nw_dst=nw_dst,
+				tp_src=tp_src, tp_dst=tp_dst, actions=fields['actions'])
+			return rule, fields
 
-		packets = [Rule(in_port='1', nw_src='10.0.0.%d' % host, tp_src='1',
-			nw_dst='8.8.8.8', tp_dst=str(port))
-			for host in range(9) for port in range(6)]
-		for _ in range(150):
-			rules = [random_rule() for _ in range(generator.randrange(2, 7))]
+		def decision(rules_fields, packet):
+			for fields in rules_fields:
+				if fields['direction'] == packet['direction'] and \
+					fields['nw_proto'] == packet['nw_proto'] and \
+					all(fields[key][0] <= packet[key] <= fields[key][1]
+						for key in ('nw_src', 'nw_dst', 'tp_src', 'tp_dst')):
+					return fields['actions']
+			return None
+
+		keys = ('direction', 'nw_proto', 'nw_src', 'nw_dst', 'tp_src', 'tp_dst')
+		packets = [dict(zip(keys, values)) for values in itertools.product(
+			['IN', 'OUT'], ['TCP', 'UDP'], range(6), range(4), range(4), range(5))]
+		for _ in range(400):
+			pairs = [random_rule() for _ in range(generator.randrange(2, 9))]
+			rules = [rule for rule, _ in pairs]
 			kept = self.resolver.remove_redundant_rules(rules)
 			remaining = iter(rules)
 			self.assertTrue(all(any(rule is other for other in remaining) for rule in kept),
 				'kept rules must stay in their original order')
+			if len(kept) == len(rules):
+				continue
+			fields_of = dict((id(rule), fields) for rule, fields in pairs)
+			before = [fields for _, fields in pairs]
+			after = [fields_of[id(rule)] for rule in kept]
 			for packet in packets:
-				self.assertEqual(first_match(kept, packet), first_match(rules, packet),
+				self.assertEqual(decision(after, packet), decision(before, packet),
 					'%s changed for %s -> %s' % (packet, rules, kept))

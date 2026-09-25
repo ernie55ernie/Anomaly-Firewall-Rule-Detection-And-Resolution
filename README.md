@@ -126,7 +126,6 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 ### Critical and high
 | Severity | Problem | Where | Issue |
 |---|---|---|---|
-| Critical | Redundancy removal deletes rules that are not redundant, turning DENY into ALLOW | `resolve_anomalies` | [#2](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/2) |
 | Critical | Unparseable IP and port values are read as `ANY`, and unknown protocols as TCP | `Rule._sanity_check` | [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) |
 | Critical | Resolving correlated rules can put an ALLOW piece in front of the DENY overlap | `resolve`, `split` | [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) |
 | Critical | Merging can delete a DENY rule when two sibling edges have the same range | `subtree_equal` | [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) |
@@ -136,12 +135,15 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 | High | `ICMPv6` is read as TCP, and `dl_type` IPv6 as IPv4 | `Rule._sanity_check` | [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) |
 | High | Detection and resolution are slow: each wildcard port check builds a 65,536-element set | `Rule.portstr2range` | [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) |
 
+Fixed since the audit:
+- [#2](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/2) (Critical): redundancy removal no longer deletes a rule when an overlapping rule with a different action comes before the rule that contains it.
+
 ### Medium
 - `resolve_anomalies` modifies the caller's `Rule` objects in place, so the input list is corrupted after resolving.
-- `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. Redundancy is reported without checking the rules in between, and the function returns nothing.
+- `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.
 - `--merge` runs on unresolved rules, but the rule tree ignores order, so the merged result may not match any ordering of the input.
 - Parser gaps:
-  - A reversed port range (`80-20`) becomes an empty range, which resolve drops silently.
+  - A reversed port range (`80-20`) is accepted silently and becomes an empty range that matches nothing.
   - Ports above 65535 are accepted.
   - `.replace('/32', '')` turns `10.0.0.1/3200` into `10.0.0.100`.
   - Text after `>` is ignored, so a second rule on the same line is lost.
@@ -149,7 +151,7 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
   - A glob such as `10.0.1-2.*` is cut down to its first /24.
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
-- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Detection, resolution, splitting, merging and input checking have no tests.
+- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Only redundancy removal, the redundancy reports of detection and the list handling in `resolve()` are tested; the rest of detection, the insert and split steps of resolution, merging and input checking have no tests.
 - The resolved list in [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm) is out of date and contains shadowing anomalies itself. [Possible Anomalies Between Two Rules](#possible-anomalies-between-two-rules) says inclusive matches "reorder the one with the reject action", but the code moves the more specific rule first whatever its action.
 
 ### Low

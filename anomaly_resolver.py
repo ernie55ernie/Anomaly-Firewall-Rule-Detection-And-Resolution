@@ -419,14 +419,21 @@ class AnomalyResolver:
 		self.resolver_logger.info('Perform Detection\nRules list:\n\t' + \
 			'\n\t'.join(map(str, rules_list)))
 
-		combination_list = list(itertools.combinations(rules_list, 2))
-		for rule_tuple in combination_list:
-			rule_0 = rule_tuple[0]
-			rule_1 = rule_tuple[1]
+		combination_list = list(itertools.combinations(enumerate(rules_list), 2))
+		rule_redundant = dict()
+		for (index_0, rule_0), (_, rule_1) in combination_list:
 			if rule_0.disjoint(rule_1):
 				continue
 			if rule_0.issubset(rule_1) or rule_1.issubset(rule_0):
 				if rule_0.actions == rule_1.actions:
+					# A later rule inside rule_0 never matches, but rule_0 inside
+					# rule_1 may still be needed because of a rule in between.
+					if not rule_1.issubset(rule_0):
+						if index_0 not in rule_redundant:
+							rule_redundant[index_0] = self.redundant(rule_0,
+								rules_list[index_0 + 1:])
+						if not rule_redundant[index_0]:
+							continue
 					self.resolver_logger.info('Redundancy Anomaly\n\t%s\n\t%s', \
 						str(rule_0), str(rule_1))
 				else:
@@ -450,26 +457,52 @@ class AnomalyResolver:
 		for rule in old_rules_list:
 			self.insert(rule, new_rules_list)
 
-		combination_list = list(itertools.combinations(new_rules_list, 2))
-		removed_rules = list()
-		for rule_tuple in combination_list:
-			rule = rule_tuple[0]
-			if rule in removed_rules:
-				continue
-			subset_rule = rule_tuple[1]
-
-			if rule.issubset(subset_rule) and \
-				rule.actions == subset_rule.actions:
-				if rule in new_rules_list:
-					self.resolver_logger.info('Redundant rule %s', str(rule))
-					new_rules_list.remove(rule)
-					removed_rules.append(rule)
+		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
 		
 		self.resolver_logger.info('New rules list:\n\t' + \
 			'\n\t'.join(map(str, new_rules_list)))
 		self.resolver_logger.info('Finish anomalies resolving')
 		return new_rules_list
+
+	def remove_redundant_rules(self, rules_list):
+		'''
+		Return rules_list without the rules that later rules make redundant
+		'''
+		# Walk from the end so every rule is checked against the rules that
+		# actually remain after it.
+		kept_rules = list()
+		redundant_rules = list()
+		for rule in reversed(rules_list):
+			if self.redundant(rule, reversed(kept_rules)):
+				redundant_rules.append(rule)
+			else:
+				kept_rules.append(rule)
+		for rule in reversed(redundant_rules):
+			self.resolver_logger.info('Redundant rule %s', str(rule))
+		return kept_rules[::-1]
+
+	@staticmethod
+	def redundant(rule, later_rules):
+		'''
+		Whether the first later rule that contains rule has the same action,
+		with no overlapping rule of a different action before it
+		'''
+		# Stop at the first later rule that contains rule, as in the paper. An
+		# overlapping rule with a different action before it would take over
+		# some of rule's packets. The check is conservative: a rule covered only
+		# by several later rules together is kept. Only containment matters for
+		# a later rule with the same action, and any overlap for one with a
+		# different action, so each later rule needs a single check. A rule with
+		# an empty range, which matches nothing, is removed once a later rule
+		# shares its action.
+		for later_rule in later_rules:
+			if rule.actions == later_rule.actions:
+				if rule.issubset(later_rule):
+					return True
+			elif not rule.disjoint(later_rule):
+				return False
+		return False
 
 
 	def insert(self, r, new_rules_list):
@@ -502,13 +535,14 @@ class AnomalyResolver:
 		if rule.issubset(subset_rule):
 			self.resolver_logger.info('Reodering %s before %s' % \
 				(str(rule), str(subset_rule)))
-			insert_idx = new_rules_list.index(subset_rule)
+			insert_idx = self.position(new_rules_list, subset_rule)
 			new_rules_list.insert(insert_idx, rule)
 			return True
 		if subset_rule.issubset(rule):
 			return False
-		if subset_rule in new_rules_list:
-			new_rules_list.remove(subset_rule)
+		subset_idx = self.position(new_rules_list, subset_rule)
+		if subset_idx is not None:
+			del new_rules_list[subset_idx]
 		attribute_set = rule.find_attribute_set(subset_rule)
 
 		for attribute in attribute_set:
@@ -517,6 +551,18 @@ class AnomalyResolver:
 			subset_rule.actions = 'DENY'
 		self.insert(subset_rule, new_rules_list)
 		return True
+
+	@staticmethod
+	def position(rules_list, rule):
+		'''
+		Index of rule in rules_list, compared by identity
+		'''
+		# list.index and list.remove use Rule.__eq__, which ignores the action
+		# and would match another rule covering the same packets.
+		for index, other_rule in enumerate(rules_list):
+			if other_rule is rule:
+				return index
+		return None
 
 	def split(self, rule, subset_rule, attribute, new_rules_list):
 		'''

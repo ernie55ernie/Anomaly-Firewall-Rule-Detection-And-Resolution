@@ -450,26 +450,48 @@ class AnomalyResolver:
 		for rule in old_rules_list:
 			self.insert(rule, new_rules_list)
 
-		combination_list = list(itertools.combinations(new_rules_list, 2))
-		removed_rules = list()
-		for rule_tuple in combination_list:
-			rule = rule_tuple[0]
-			if rule in removed_rules:
-				continue
-			subset_rule = rule_tuple[1]
-
-			if rule.issubset(subset_rule) and \
-				rule.actions == subset_rule.actions:
-				if rule in new_rules_list:
-					self.resolver_logger.info('Redundant rule %s', str(rule))
-					new_rules_list.remove(rule)
-					removed_rules.append(rule)
+		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
 		
 		self.resolver_logger.info('New rules list:\n\t' + \
 			'\n\t'.join(map(str, new_rules_list)))
 		self.resolver_logger.info('Finish anomalies resolving')
 		return new_rules_list
+
+	def remove_redundant_rules(self, rules_list):
+		'''
+		Return rules_list without the rules that later rules make redundant
+		'''
+		# Walk from the end so every rule is checked against the rules that
+		# actually remain after it.
+		kept_rules = list()
+		redundant_rules = list()
+		for rule in reversed(rules_list):
+			if self.redundant(rule, reversed(kept_rules)):
+				redundant_rules.append(rule)
+			else:
+				kept_rules.append(rule)
+		for rule in reversed(redundant_rules):
+			self.resolver_logger.info('Redundant rule %s', str(rule))
+		return kept_rules[::-1]
+
+	def redundant(self, rule, later_rules):
+		'''
+		Whether the first later rule that contains rule has the same action,
+		with no overlapping rule of a different action before it
+		'''
+		# Stop at the first later rule that contains rule, as in the paper. An
+		# overlapping rule with a different action before it would take over
+		# some of rule's packets. The check is conservative: a rule covered only
+		# by several later rules together is kept.
+		for later_rule in later_rules:
+			if rule.disjoint(later_rule):
+				continue
+			if rule.issubset(later_rule):
+				return rule.actions == later_rule.actions
+			if rule.actions != later_rule.actions:
+				return False
+		return False
 
 
 	def insert(self, r, new_rules_list):

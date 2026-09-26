@@ -311,13 +311,15 @@ class Rule(ctypes.Structure):
 		return not first_set.intersection(second_set)
 
 	def find_attribute_set(self, subset_rule):
-		attribute_set = set()
-		for field in self._fields_:
-			if not getattr(self, field[0]) == getattr(subset_rule, field[0]) and \
-				(field[0] == 'in_port' or field[0] == 'nw_src' or 
-				field[0] == 'nw_dst' or field[0] == 'tp_src' or field[0] == 'tp_dst'):
-				attribute_set.add(field[0])
-		return attribute_set
+		'''
+		The attributes to split on where the two rules differ, in a fixed order
+		'''
+		# A list, not a set: a set of strings iterates in an order that changes
+		# with PYTHONHASHSEED, which made the resolved rules differ between
+		# runs. Splitting on the destination first tends to give fewer pieces.
+		attributes = ['tp_dst', 'nw_dst', 'tp_src', 'nw_src', 'in_port']
+		return [attribute for attribute in attributes
+			if getattr(self, attribute) != getattr(subset_rule, attribute)]
 
 	def get_attribute_range(self, attribute, format = 'range'):
 		if attribute == 'in_port' or attribute == 'tp_src' or attribute == 'tp_dst':

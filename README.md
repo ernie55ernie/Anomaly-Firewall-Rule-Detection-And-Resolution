@@ -101,15 +101,14 @@ Any other value is rejected with an error that names the line.
 10. <IN, UDP, 129.110.96.117, ANY, 129.110.96.117, 22, REJECT>
 11. <OUT, UDP, ANY, ANY, ANY, ANY, REJECT>
 ```
-After anomaly resolving, the list is free from anomalies.
+After anomaly resolving, the list is free from anomalies. This is the output of `python main.py --path rules/example_rules_1 --resolve`, which is the same on every run:
 ```
-        <IN, TCP, 129.110.96.0/24, *, 129.110.96.81-255.255.255.255, 80, ALLOW>
-        <IN, TCP, 129.110.96.0/24, *, 0.0.0.0-129.110.96.79, 80, ALLOW>
         <IN, TCP, 129.110.96.117, *, 0.0.0.0-129.110.96.79, 80, DENY>
-        <IN, TCP, 129.110.96.0-129.110.96.116, *, 129.110.96.80, 80, ALLOW>
+        <IN, TCP, 129.110.96.117, *, 129.110.96.81-255.255.255.255, 80, DENY>
+        <IN, TCP, 129.110.96.0/24, *, 0.0.0.0-129.110.96.79, 80, ALLOW>
+        <IN, TCP, 129.110.96.0/24, *, 129.110.96.81-255.255.255.255, 80, ALLOW>
         <IN, TCP, 0.0.0.0-129.110.95.255, *, 129.110.96.80, 80, ALLOW>
         <IN, TCP, 129.110.97.0-255.255.255.255, *, 129.110.96.80, 80, ALLOW>
-        <IN, TCP, 129.110.96.118-129.110.96.255, *, 129.110.96.80, 80, ALLOW>
         <IN, TCP, 129.110.96.0/24, *, 129.110.96.80, 80, DENY>
         <OUT, TCP, 129.110.96.80, 22, *, *, DENY>
         <IN, TCP, 129.110.96.117, *, 129.110.96.80, 22, DENY>
@@ -137,7 +136,6 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 ### Critical and high
 | Severity | Problem | Where | Issue |
 |---|---|---|---|
-| High | The resolved rule list changes shape between runs (depends on `PYTHONHASHSEED`); its decisions no longer do | `find_attribute_set` | [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) |
 | High | `--merge` raises `KeyError` at tree nodes with 3 or more children | `merge` | [#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7) |
 | High | `--merge` crashes on IP ranges ending at 255.255.255.255, including `rules/example_rules_1` | `Rule.contiguous` | [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) |
 | High | Detection and resolution are slow: each wildcard port check builds a 65,536-element set | `Rule.portstr2range` | [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) |
@@ -148,6 +146,7 @@ Fixed since the audit:
 - [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
 - [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) (Critical): resolution decides each piece from the original rules that contain it, so a piece can no longer override the reject decision on a correlated overlap. Resolution also works on copies, so the caller's rules are no longer changed.
 - [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) (Critical): merging compares the full set of rules below two sibling edges, including children that share a range, so it no longer drops a rule. If the two half ranges of the issue's example are listed before the full range, `merge()` still raises `KeyError` first ([#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7)).
+- [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) (High): rules are split on their attributes in a fixed order, so resolving gives the same rules on every run instead of depending on `PYTHONHASHSEED`.
 
 ### Medium
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.
@@ -156,7 +155,6 @@ Fixed since the audit:
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
 - `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Resolution, merging, input checking and the redundancy reports of detection are tested; the rest of detection has no tests.
-- The resolved list in [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm) is out of date and contains shadowing anomalies itself.
 
 ### Low
 - The rule priority is parsed but ignored: file order decides, whereas in Ryu the higher priority wins. Resolved rules keep duplicate priorities.

@@ -4,6 +4,8 @@ import random
 import tempfile
 import unittest
 
+import networkx as nx
+
 from anomaly_resolver import AnomalyResolver, Rule, SimpleRuleParser
 
 
@@ -32,6 +34,140 @@ class RuleHelperTests(unittest.TestCase):
 			Rule.combine_range(left, right, attribute='nw_dst'),
 			'129.110.96.64-129.110.96.164'
 		)
+
+
+class MergeTests(unittest.TestCase):
+	# Trees are built with plot=False so the README images in img/ are not
+	# overwritten.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def paths(self):
+		# One list of edge ranges per root-to-leaf path, that is, per rule.
+		tree = self.resolver.tree
+		result = list()
+		pending = [(self.resolver.get_rule_tree_root(), [])]
+		while pending:
+			node, ranges = pending.pop()
+			edges = list(tree.edges([node]))
+			if not edges:
+				result.append(ranges)
+			for edge in edges:
+				pending.append((edge[1], ranges + [tree.edges[edge]['range']]))
+		return sorted(result)
+
+	def merge(self, rules):
+		self.resolver.construct_rule_tree(rules, plot=False)
+		self.resolver.merge(self.resolver.get_rule_tree_root())
+		return self.paths()
+
+	def test_rules_below_siblings_with_the_same_range_are_kept(self):
+		# Issue #5: merging 1-5 and 6-10 left two 1-10 edges below each source,
+		# the sources were then taken as equal, and the DENY rule was dropped.
+		rules = [
+			Rule(nw_src='10.0.0.1', tp_src='1-10', nw_dst='10.0.1.1', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='10.0.0.1', tp_src='1-5', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='10.0.0.1', tp_src='6-10', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='10.0.0.2', tp_src='1-10', nw_dst='10.0.1.3', tp_dst='80', actions='DENY'),
+			Rule(nw_src='10.0.0.2', tp_src='1-5', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='10.0.0.2', tp_src='6-10', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
+		]
+		self.assertEqual(self.merge(rules), [
+			['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.1', '80', 'ALLOW'],
+			['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.2', '80', 'ALLOW'],
+			['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.2', '80', 'ALLOW'],
+			['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.3', '80', 'DENY'],
+		])
+
+	def test_subtree_equal_counts_children_with_the_same_range(self):
+		def subtree(node, actions):
+			for index, action in enumerate(actions):
+				child = '%s.%d' % (node, index)
+				self.resolver.tree.add_edge(node, child, range='1-10')
+				self.resolver.tree.add_edge(child, child + '.leaf', range=action)
+
+		self.resolver.tree = nx.DiGraph()
+		for node, actions in [('a', ['ALLOW', 'DENY']), ('b', ['DENY', 'DENY']), ('c', ['DENY', 'ALLOW'])]:
+			self.resolver.tree.add_edge('root', node, range=node)
+			subtree(node, actions)
+		# The last 1-10 child of a and b match, but their first ones differ.
+		self.assertFalse(self.resolver.subtree_equal(('root', 'a'), ('root', 'b')))
+		# a and c hold the same children, added in a different order.
+		self.assertTrue(self.resolver.subtree_equal(('root', 'a'), ('root', 'c')))
+
+	def test_merging_keeps_every_rule_in_random_variants_of_issue_5(self):
+		# Each source gets a full tp_src range plus two halves that merge into
+		# it, with random destinations and actions.
+		generator = random.Random(9)
+		sources = ['10.0.0.1', '10.0.0.2']
+		for _ in range(150):
+			rules = list()
+			for source in sources:
+				rules.append(Rule(nw_src=source, tp_src='1-10', tp_dst='80',
+					nw_dst='10.0.1.%d' % generator.randrange(1, 4),
+					actions=generator.choice(['ALLOW', 'DENY'])))
+				destination = '10.0.1.%d' % generator.randrange(1, 4)
+				action = generator.choice(['ALLOW', 'DENY'])
+				for ports in ['1-5', '6-10']:
+					rules.append(Rule(nw_src=source, tp_src=ports, tp_dst='80',
+						nw_dst=destination, actions=action))
+			expected = set((rule.nw_src, rule.nw_dst, rule.actions) for rule in rules)
+			merged = set()
+			for path in self.merge(rules):
+				addresses = Rule.ipstr2range(path[2])
+				for source in sources:
+					if Rule.ipstr2range(source)[0] in addresses:
+						merged.add((source, path[4], path[6]))
+			self.assertEqual(merged, expected, '%s -> %s' % (rules, self.paths()))
+
+	def test_merging_keeps_the_actions_every_packet_can_reach(self):
+		# Every root-to-leaf path is a rule, so a merge must not change which
+		# actions each packet can reach. Values are drawn from aligned pieces
+		# so that merges are common.
+		generator = random.Random(5)
+		choices = {'nw_src': ['10.0.0.0', '10.0.0.1', '10.0.0.0-10.0.0.1'],
+			'tp_src': ['1-2', '3-4', '1-4'], 'nw_dst': ['10.0.1.0-10.0.1.1',
+			'10.0.1.2-10.0.1.3', '10.0.1.0-10.0.1.3'], 'tp_dst': ['1', '2', '1-2']}
+		order = ['nw_src', 'tp_src', 'nw_dst', 'tp_dst']
+
+		def bounds(key, value):
+			values = Rule.ipstr2range(value) if key.startswith('nw') else Rule.portstr2range(value)
+			return int(values[0]), int(values[-1])
+
+		packets = list(itertools.product(
+			[bounds('nw_src', '10.0.0.%d' % host)[0] for host in range(3)], range(6),
+			[bounds('nw_dst', '10.0.1.%d' % host)[0] for host in range(5)], range(4)))
+
+		def reachable():
+			# Each path's ranges as integer bounds, in the order of `order`.
+			paths = [([bounds(key, value) for key, value in zip(order, path[2:6])], path[6])
+				for path in self.paths()]
+			return dict((packet, set(action for ranges, action in paths
+				if all(low <= value <= high for value, (low, high) in zip(packet, ranges))))
+				for packet in packets)
+
+		merged_cases = 0
+		for _ in range(60):
+			rules = dict()
+			for _ in range(generator.randrange(3, 10)):
+				key = tuple(generator.choice(choices[field]) for field in order)
+				rules.setdefault(key, generator.choice(['ALLOW', 'ALLOW', 'DENY']))
+			self.resolver.construct_rule_tree([Rule(actions=action, **dict(zip(order, key)))
+				for key, action in rules.items()], plot=False)
+			before, paths_before = reachable(), len(self.paths())
+			try:
+				self.resolver.merge(self.resolver.get_rule_tree_root())
+			except KeyError:
+				# merge() still raises KeyError at some nodes with three or
+				# more children (#7); those trees are skipped here.
+				continue
+			merged_cases += len(self.paths()) < paths_before
+			self.assertEqual(reachable(), before)
+		self.assertGreater(merged_cases, 5)
 
 
 class ParserTests(unittest.TestCase):

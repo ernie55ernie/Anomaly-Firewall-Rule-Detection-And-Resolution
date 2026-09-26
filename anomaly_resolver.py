@@ -798,21 +798,20 @@ class AnomalyResolver:
 
 	def subtree_equal(self, e_1, e_2):
 		'''
+		Whether the subtrees below edges e_1 and e_2 hold the same rules
 		'''
+		return self.subtree_signature(e_1[1]) == self.subtree_signature(e_2[1])
+
+	def subtree_signature(self, node):
+		'''
+		The ranges of every edge below node, as nested sorted tuples
+		'''
+		# A merge can leave two sibling edges with the same range, such as a
+		# second 1-10 from merging 1-5 and 6-10. Sorting keeps both, where a
+		# dict keyed by range would drop one and match different subtrees.
 		tree = self.tree
-		edges = tree.edges()
-		edges_1 = list(tree.edges([e_1[1]]))
-		edges_2 = list(tree.edges([e_2[1]]))
-		if len(edges_1) != len(edges_2):
-			return False
-		children_1 = {edges[edge]['range']: edge for edge in edges_1}
-		children_2 = {edges[edge]['range']: edge for edge in edges_2}
-		if set(children_1.keys()) != set(children_2.keys()):
-			return False
-		for edge_range, child_edge in children_1.items():
-			if not self.subtree_equal(child_edge, children_2[edge_range]):
-				return False
-		return True
+		return tuple(sorted((tree.edges[edge]['range'], self.subtree_signature(edge[1]))
+			for edge in tree.edges([node])))
 
 if __name__ == '__main__':
 

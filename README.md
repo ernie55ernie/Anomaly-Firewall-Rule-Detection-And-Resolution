@@ -4,7 +4,7 @@ This is an implementation of the [paper](https://link.springer.com/chapter/10.10
 Firewall rules define the security policy for network traffic. Any error can compromise the system security by letting unwanted traffic pass or blocking desired traffic.
 
 > [!WARNING]
-> Resolution applies the policy described below rather than keeping the input's first-match decisions, so a specific rule can override a broader one listed before it. Merging still has open bugs, including one that can drop a DENY rule. Review resolved and merged rules before using them. See [Known Issues](#known-issues).
+> Resolution applies the policy described below rather than keeping the input's first-match decisions, so a specific rule can override a broader one listed before it. Merging is a separate step: `--merge` works on the rules as given, whether or not they have been resolved, so a completed merge doesn't mean the rules are free of anomalies. `--merge` can also still crash on some inputs. Review resolved and merged rules before using them. See [Known Issues](#known-issues).
 
 - [Usage](#usage)
 - [Relation Between Two Rules](#relation-between-two-rules)
@@ -137,7 +137,6 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 ### Critical and high
 | Severity | Problem | Where | Issue |
 |---|---|---|---|
-| Critical | Merging can delete a DENY rule when two sibling edges have the same range | `subtree_equal` | [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) |
 | High | The resolved rule list changes shape between runs (depends on `PYTHONHASHSEED`); its decisions no longer do | `find_attribute_set` | [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) |
 | High | `--merge` raises `KeyError` at tree nodes with 3 or more children | `merge` | [#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7) |
 | High | `--merge` crashes on IP ranges ending at 255.255.255.255, including `rules/example_rules_1` | `Rule.contiguous` | [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) |
@@ -148,6 +147,7 @@ Fixed since the audit:
 - [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) (Critical): values that don't parse are rejected with an error naming the line, instead of being read as `ANY`, TCP, `IN` or `DENY`.
 - [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
 - [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) (Critical): resolution decides each piece from the original rules that contain it, so a piece can no longer override the reject decision on a correlated overlap. Resolution also works on copies, so the caller's rules are no longer changed.
+- [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) (Critical): merging compares the full set of rules below two sibling edges, including children that share a range, so it no longer drops a rule. If the two half ranges of the issue's example are listed before the full range, `merge()` still raises `KeyError` first ([#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7)).
 
 ### Medium
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.
@@ -155,7 +155,7 @@ Fixed since the audit:
 - The parser ignores text after `>`, so a second rule on the same line is lost.
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
-- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Resolution, input checking and the redundancy reports of detection are tested; the rest of detection and merging have no tests.
+- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Resolution, merging, input checking and the redundancy reports of detection are tested; the rest of detection has no tests.
 - The resolved list in [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm) is out of date and contains shadowing anomalies itself.
 
 ### Low

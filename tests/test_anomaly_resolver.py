@@ -64,6 +64,23 @@ class ParserTests(unittest.TestCase):
 		rules = self.parse('1.\t<IN,\tUDP,\t10.0.0.1,\tANY,\tANY,\t53,\tACCEPT>')
 		self.assertEqual(str(rules[0]), '<IN, UDP, 10.0.0.1, *, *, 53, ALLOW>')
 
+	def test_whitespace_inside_a_field_is_rejected(self):
+		# It used to be deleted, so '22 23' became port 2223.
+		for line, bad_value in [('1. <IN, TCP, 10.0.0.1, ANY, ANY, 22 23, ACCEPT>', "port value '22 23'"),
+			('1. <IN, TCP, 129.110.96.1\t17, ANY, ANY, 22, ACCEPT>', "IPv4 value '129.110.96.1\\t17'"),
+			('1. <IN, TCP, 10.0.0.1, ANY, ANY, 22, ACC EPT>', "action value 'ACC EPT'")]:
+			with self.subTest(line=line):
+				with self.assertRaises(ValueError) as error:
+					self.parse(line)
+				self.assertIn('Invalid %s on line 1' % bad_value, str(error.exception))
+
+	def test_priority_must_be_ascii_digits(self):
+		for priority in ['٥', '1_0', '+1', '-1']:
+			with self.subTest(priority=priority):
+				with self.assertRaises(ValueError) as error:
+					self.parse('%s. <IN, TCP, ANY, ANY, ANY, 80, REJECT>' % priority)
+				self.assertIn('Invalid priority on line 1', str(error.exception))
+
 
 class InputValidationTests(unittest.TestCase):
 
@@ -72,11 +89,16 @@ class InputValidationTests(unittest.TestCase):
 		invalid = {
 			'nw_src': ['129.110.96.300', '129.110.96.1l7', '2001:db8::1', '10.*.0.*',
 				'', '10.0.0.1/33', '10.0.0.1/3200', '10.0.0.9-10.0.0.1', '10.0.0.9-1',
-				'10.0.0.1-10.0.0.2-3', 'abc-5', '010.0.0.1'],
-			'tp_dst': ['8O', '44E', '0x50', '', '-1', '1-', '70000', '1-70000', '80-20', '1-2-3'],
-			'nw_proto': ['ANY', 'SCTP', ''],
-			'direction': ['INBOUND', ''],
-			'actions': ['DROP', ''],
+				'10.0.0.1-10.0.0.2-3', 'abc-5', '010.0.0.1',
+				# Mask notation, signed or empty prefixes, and whitespace.
+				'10.0.0.0/255.255.255.0', '10.0.0.1/0.0.0.0', '10.0.0.0/0.0.0.255',
+				'10.0.0.1/-0', '10.0.0.1/+24', '10.0.0.0/', '10.0.0.0/24/8',
+				'10.0.0.0/ 24', ' 10.0.0.1', '١٠.0.0.1'],
+			'tp_dst': ['8O', '44E', '0x50', '', '-1', '1-', '70000', '1-70000', '80-20', '1-2-3',
+				'22 23', ' 80', '٨٠', '８０'],
+			'nw_proto': ['ANY', 'SCTP', '', 'ıcmp'],
+			'direction': ['INBOUND', '', 'ın'],
+			'actions': ['DROP', '', 'ACC EPT'],
 			'priority': [-1, 65536, '5', True],
 		}
 		for field, values in invalid.items():
@@ -89,8 +111,8 @@ class InputValidationTests(unittest.TestCase):
 		valid = [
 			('nw_src', 'ANY', '*'), ('nw_src', 'any', '*'), ('nw_src', '*', '*'),
 			('nw_src', '10.0.0.1', '10.0.0.1'), ('nw_src', '10.0.0.1/32', '10.0.0.1'),
-			('nw_src', '10.0.0.5/24', '10.0.0.5/24'),
-			('nw_src', '10.0.0.0/255.255.255.0', '10.0.0.0/255.255.255.0'),
+			('nw_src', '10.0.0.0/24', '10.0.0.0/24'), ('nw_src', '10.0.0.0/024', '10.0.0.0/24'),
+			('nw_src', '0.0.0.0/0', '0.0.0.0/0'),
 			('nw_src', '202.80.169.29-63', '202.80.169.29-202.80.169.63'),
 			('nw_src', '129.110.96.*', '129.110.96.0/24'),
 			('nw_src', '10.0.1-2.*', '10.0.1.0-10.0.2.255'),
@@ -103,7 +125,24 @@ class InputValidationTests(unittest.TestCase):
 		]
 		for field, value, expected in valid:
 			with self.subTest(field=field, value=value):
-				self.assertEqual(getattr(Rule(**{field: value}), field), expected)
+				rule = Rule(**{field: value})
+				self.assertEqual(getattr(rule, field), expected)
+				# The stored value must also parse in the comparison code, which
+				# used to crash on values like 10.0.0.1/-0 that passed validation.
+				rule.disjoint(Rule())
+
+	def test_cidr_must_use_the_network_address(self):
+		# Host bits set outside the prefix usually mean a typo that widens the
+		# rule, as ipaddress.ip_network(value, strict=True) also rejects.
+		for value, expected in [('10.0.0.0/24', '10.0.0.0/24'), ('10.0.0.5/24', None),
+			('129.110.96.117/2', None), ('10.0.0.1/32', '10.0.0.1'),
+			('0.0.0.0/0', '0.0.0.0/0'), ('10.0.0.1/0', None)]:
+			with self.subTest(value=value):
+				if expected is None:
+					with self.assertRaises(ValueError):
+						Rule(nw_src=value)
+				else:
+					self.assertEqual(Rule(nw_src=value).nw_src, expected)
 
 
 class ResolverTests(unittest.TestCase):

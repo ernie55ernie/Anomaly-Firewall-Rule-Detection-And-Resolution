@@ -78,10 +78,10 @@ This algorithm resolves the anomalies as follows:
 Firewall rules are expected in the following format:
 - priority. <direction, protocol, source IP, source port, destination IP, destination port, action>
 
-Accepted values, case-insensitive:
+Accepted values, which are case-insensitive ASCII with no whitespace inside:
 - direction: `IN` or `OUT`
 - protocol: `TCP`, `UDP`, `ICMP` or `ICMPv6`
-- IP: `ANY` or `*`, an address (`10.0.0.1`), a CIDR block (`10.0.0.0/24`), a range (`10.0.0.1-10.0.0.9` or `10.0.0.1-9`), or a glob (`10.0.0.*`)
+- IP: `ANY` or `*`, an address (`10.0.0.1`), a CIDR block (`10.0.0.0/24`), a range (`10.0.0.1-10.0.0.9` or `10.0.0.1-9`), or a glob (`10.0.0.*`). A CIDR block needs a prefix length from 0 to 32 on the network address itself: `10.0.0.5/24` and mask notation such as `10.0.0.0/255.255.255.0` are rejected.
 - port: `ANY` or `*`, a port (`80`) or a range (`1000-2000`), within 0-65535
 - action: `ACCEPT` or `ALLOW`, `REJECT` or `DENY`
 

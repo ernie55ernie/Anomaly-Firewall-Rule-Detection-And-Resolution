@@ -42,7 +42,7 @@ class ParserTests(unittest.TestCase):
 			handle.write('\n')
 			handle.write('1. <IN, TCP, ANY, ANY, ANY, 80, REJECT>\n')
 			path = handle.name
-		self.addCleanup(lambda: os.remove(path))
+		self.addCleanup(os.remove, path)
 
 		parsed = SimpleRuleParser(path)
 		self.assertEqual(len(parsed.rules), 1)
@@ -51,7 +51,7 @@ class ParserTests(unittest.TestCase):
 		with tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8') as handle:
 			handle.write(''.join(line + '\n' for line in lines))
 			path = handle.name
-		self.addCleanup(lambda: os.remove(path))
+		self.addCleanup(os.remove, path)
 		return SimpleRuleParser(path).rules
 
 	def test_invalid_value_names_the_line(self):
@@ -143,6 +143,24 @@ class InputValidationTests(unittest.TestCase):
 						Rule(nw_src=value)
 				else:
 					self.assertEqual(Rule(nw_src=value).nw_src, expected)
+
+	def test_port_ranges_are_stored_in_canonical_form(self):
+		# One spelling per range, since rules are also compared as text.
+		for value, expected in [('5-5', '5'), ('65535-65535', '65535'), ('00-65535', '*'),
+			('0-65535', '*'), ('0-65534', '0-65534'), ('080', '80'), ('0080-0090', '80-90')]:
+			with self.subTest(value=value):
+				self.assertEqual(Rule(tp_dst=value).tp_dst, expected)
+
+	def test_keywords_are_stored_in_canonical_spelling(self):
+		for field, value, expected in [('dl_type', 'arp', 'ARP'), ('dl_type', 'IPV6', 'IPv6'),
+			('nw_proto', 'Tcp', 'TCP'), ('nw_proto', 'icmpv6', 'ICMPv6'),
+			('direction', 'In', 'IN'), ('actions', 'Accept', 'ALLOW'), ('actions', 'Deny', 'DENY')]:
+			with self.subTest(field=field, value=value):
+				self.assertEqual(getattr(Rule(**{field: value}), field), expected)
+
+	def test_unknown_field_is_rejected(self):
+		with self.assertRaisesRegex(ValueError, "Unknown field 'ip'"):
+			Rule._sanity_check('10.0.0.1', 'ip')
 
 
 class ResolverTests(unittest.TestCase):

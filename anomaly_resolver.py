@@ -145,22 +145,25 @@ class Rule(ctypes.Structure):
 		if not isinstance(value, str) or not value.isascii() or \
 			any(character.isspace() for character in value):
 			raise ValueError(error)
-		wildcard = value.upper() in ['ANY', '*']
+		upper_value = value.upper()
+		wildcard = upper_value in ['ANY', '*']
 
 		if field == 'port':
-			if wildcard or value == '0-65535':
+			if wildcard:
 				return '*'
 			bounds = value.split('-')
 			if len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
 				low, high = int(bounds[0]), int(bounds[-1])
 				if low <= high <= 65535:
-					return str(low) if len(bounds) == 1 else '%d-%d' % (low, high)
+					if (low, high) == (0, 65535):
+						return '*'
+					return Rule.portrange2str(range(low, high + 1))
 			raise ValueError(error)
 
 		if field == 'dl_type':
-			dl_types = {'ARP': 'ARP', 'IPV4': 'IPv4', 'IPV6': 'IPv6'}
-			if value.upper() in dl_types:
-				return dl_types[value.upper()]
+			dl_types = {name.upper(): name for name in ['ARP', 'IPv4', 'IPv6']}
+			if upper_value in dl_types:
+				return dl_types[upper_value]
 			raise ValueError(error)
 
 		if field == 'ipv4':
@@ -198,22 +201,24 @@ class Rule(ctypes.Structure):
 			raise ValueError(error)
 
 		if field == 'nw_proto':
-			protocols = {'TCP': 'TCP', 'UDP': 'UDP', 'ICMP': 'ICMP', 'ICMPV6': 'ICMPv6'}
-			if value.upper() in protocols:
-				return protocols[value.upper()]
+			protocols = {name.upper(): name for name in ['TCP', 'UDP', 'ICMP', 'ICMPv6']}
+			if upper_value in protocols:
+				return protocols[upper_value]
 			raise ValueError(error)
 
 		if field == 'direction':
-			if value.upper() in ['IN', 'OUT']:
-				return value.upper()
+			if upper_value in ['IN', 'OUT']:
+				return upper_value
 			raise ValueError(error)
 
 		if field == 'action':
-			if value.upper() in ['DENY', 'REJECT']:
+			if upper_value in ['DENY', 'REJECT']:
 				return 'DENY'
-			if value.upper() in ['ALLOW', 'ACCEPT']:
+			if upper_value in ['ALLOW', 'ACCEPT']:
 				return 'ALLOW'
 			raise ValueError(error)
+
+		raise ValueError('Unknown field %r' % (field,))
 
 	def __repr__(self, format='basic'):
 		if format == 'detail':

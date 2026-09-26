@@ -804,14 +804,18 @@ class AnomalyResolver:
 
 	def subtree_signature(self, node):
 		'''
-		The ranges of every edge below node, as nested sorted tuples
+		The set of rules below node, each as the tuple of ranges on its path
 		'''
 		# A merge can leave two sibling edges with the same range, such as a
-		# second 1-10 from merging 1-5 and 6-10. Sorting keeps both, where a
-		# dict keyed by range would drop one and match different subtrees.
+		# second 1-10 from merging 1-5 and 6-10. Comparing sets of paths keeps
+		# both, where a dict keyed by range would drop one and match different
+		# subtrees. A set also ignores the order and number of copies of a rule.
 		tree = self.tree
-		return tuple(sorted((tree.edges[edge]['range'], self.subtree_signature(edge[1]))
-			for edge in tree.edges([node])))
+		edges = list(tree.edges([node]))
+		if not edges:
+			return frozenset([()])
+		return frozenset((tree.edges[edge]['range'],) + path
+			for edge in edges for path in self.subtree_signature(edge[1]))
 
 if __name__ == '__main__':
 

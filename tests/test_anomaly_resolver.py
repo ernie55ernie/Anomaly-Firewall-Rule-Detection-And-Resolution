@@ -65,43 +65,78 @@ class MergeTests(unittest.TestCase):
 		self.resolver.merge(self.resolver.get_rule_tree_root())
 		return self.paths()
 
+	def issue_5_rules(self, order):
+		# For each source, a full tp_src range and two halves that merge into
+		# it, listed in the given order.
+		rules = list()
+		for source, full_range in [('10.0.0.1', ('10.0.1.1', 'ALLOW')), ('10.0.0.2', ('10.0.1.3', 'DENY'))]:
+			pieces = [('1-10',) + full_range, ('1-5', '10.0.1.2', 'ALLOW'), ('6-10', '10.0.1.2', 'ALLOW')]
+			for ports, destination, action in [pieces[index] for index in order]:
+				rules.append(Rule(nw_src=source, tp_src=ports, nw_dst=destination, tp_dst='80', actions=action))
+		return rules
+
+	ISSUE_5_MERGED = [
+		['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.1', '80', 'ALLOW'],
+		['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.2', '80', 'ALLOW'],
+		['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.2', '80', 'ALLOW'],
+		['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.3', '80', 'DENY'],
+	]
+
 	def test_rules_below_siblings_with_the_same_range_are_kept(self):
 		# Issue #5: merging 1-5 and 6-10 left two 1-10 edges below each source,
 		# the sources were then taken as equal, and the DENY rule was dropped.
-		rules = [
-			Rule(nw_src='10.0.0.1', tp_src='1-10', nw_dst='10.0.1.1', tp_dst='80', actions='ALLOW'),
-			Rule(nw_src='10.0.0.1', tp_src='1-5', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
-			Rule(nw_src='10.0.0.1', tp_src='6-10', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
-			Rule(nw_src='10.0.0.2', tp_src='1-10', nw_dst='10.0.1.3', tp_dst='80', actions='DENY'),
-			Rule(nw_src='10.0.0.2', tp_src='1-5', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
-			Rule(nw_src='10.0.0.2', tp_src='6-10', nw_dst='10.0.1.2', tp_dst='80', actions='ALLOW'),
-		]
-		self.assertEqual(self.merge(rules), [
-			['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.1', '80', 'ALLOW'],
-			['IN', 'TCP', '10.0.0.1', '1-10', '10.0.1.2', '80', 'ALLOW'],
-			['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.2', '80', 'ALLOW'],
-			['IN', 'TCP', '10.0.0.2', '1-10', '10.0.1.3', '80', 'DENY'],
-		])
+		# Only this order, the full range first, avoids the KeyError in #7.
+		self.assertEqual(self.merge(self.issue_5_rules((0, 1, 2))), self.ISSUE_5_MERGED)
 
-	def test_subtree_equal_counts_children_with_the_same_range(self):
-		def subtree(node, actions):
-			for index, action in enumerate(actions):
+	@unittest.expectedFailure
+	def test_issue_5_rules_in_the_other_insertion_orders(self):
+		# Known limitation: with a half range listed first, merge() raises
+		# KeyError at the tp_src node (#7), on master and with the #5 fix.
+		# Remove expectedFailure once #7 is fixed.
+		for order in [(1, 2, 0), (1, 0, 2)]:
+			self.assertEqual(self.merge(self.issue_5_rules(order)), self.ISSUE_5_MERGED)
+
+	def hand_built_tree(self, subtrees):
+		# A root edge for each node, and below it one (range, action) path per child.
+		self.resolver.tree = nx.DiGraph()
+		for node, children in subtrees.items():
+			self.resolver.tree.add_edge('root', node, range=node)
+			for index, (child_range, action) in enumerate(children):
 				child = '%s.%d' % (node, index)
-				self.resolver.tree.add_edge(node, child, range='1-10')
+				self.resolver.tree.add_edge(node, child, range=child_range)
 				self.resolver.tree.add_edge(child, child + '.leaf', range=action)
 
-		self.resolver.tree = nx.DiGraph()
-		for node, actions in [('a', ['ALLOW', 'DENY']), ('b', ['DENY', 'DENY']), ('c', ['DENY', 'ALLOW'])]:
-			self.resolver.tree.add_edge('root', node, range=node)
-			subtree(node, actions)
+	def test_subtree_equal_rejects_the_issue_5_shape(self):
 		# The last 1-10 child of a and b match, but their first ones differ.
+		self.hand_built_tree({'a': [('1-10', 'ALLOW'), ('1-10', 'DENY')],
+			'b': [('1-10', 'DENY'), ('1-10', 'DENY')]})
 		self.assertFalse(self.resolver.subtree_equal(('root', 'a'), ('root', 'b')))
-		# a and c hold the same children, added in a different order.
+
+	def test_subtree_equal_ignores_the_order_children_were_added(self):
+		self.hand_built_tree({'a': [('1-10', 'ALLOW'), ('1-10', 'DENY')],
+			'c': [('1-10', 'DENY'), ('1-10', 'ALLOW')]})
 		self.assertTrue(self.resolver.subtree_equal(('root', 'a'), ('root', 'c')))
+
+	def test_subtree_equal_ignores_duplicate_copies_of_a_rule(self):
+		# a and b hold the same two rules, a with two copies of the first and
+		# b with two copies of the second.
+		self.hand_built_tree({'a': [('1-5', 'ALLOW'), ('1-5', 'ALLOW'), ('6-10', 'DENY')],
+			'b': [('1-5', 'ALLOW'), ('6-10', 'DENY'), ('6-10', 'DENY')]})
+		self.assertTrue(self.resolver.subtree_equal(('root', 'a'), ('root', 'b')))
+
+	def test_duplicate_copies_of_a_rule_do_not_block_a_merge(self):
+		# Merging 1-5 and 6-10 below 10.0.0.1 leaves two copies of its 1-10
+		# rule, while 10.0.0.2 holds that rule once. The sources still merge.
+		rules = [Rule(nw_src='10.0.0.1', tp_src=ports, nw_dst='10.0.1.1', tp_dst='80', actions='ALLOW')
+			for ports in ['1-10', '1-5', '6-10']]
+		rules.append(Rule(nw_src='10.0.0.2', tp_src='1-10', nw_dst='10.0.1.1', tp_dst='80', actions='ALLOW'))
+		self.assertEqual(set(map(tuple, self.merge(rules))),
+			{('IN', 'TCP', '10.0.0.1-10.0.0.2', '1-10', '10.0.1.1', '80', 'ALLOW')})
 
 	def test_merging_keeps_every_rule_in_random_variants_of_issue_5(self):
 		# Each source gets a full tp_src range plus two halves that merge into
-		# it, with random destinations and actions.
+		# it, with random destinations and actions. The full range always comes
+		# first, since the other orders hit the KeyError in #7.
 		generator = random.Random(9)
 		sources = ['10.0.0.1', '10.0.0.2']
 		for _ in range(150):
@@ -159,12 +194,7 @@ class MergeTests(unittest.TestCase):
 			self.resolver.construct_rule_tree([Rule(actions=action, **dict(zip(order, key)))
 				for key, action in rules.items()], plot=False)
 			before, paths_before = reachable(), len(self.paths())
-			try:
-				self.resolver.merge(self.resolver.get_rule_tree_root())
-			except KeyError:
-				# merge() still raises KeyError at some nodes with three or
-				# more children (#7); those trees are skipped here.
-				continue
+			self.resolver.merge(self.resolver.get_rule_tree_root())
 			merged_cases += len(self.paths()) < paths_before
 			self.assertEqual(reachable(), before)
 		self.assertGreater(merged_cases, 5)

@@ -4,7 +4,7 @@ This is an implementation of the [paper](https://link.springer.com/chapter/10.10
 Firewall rules define the security policy for network traffic. Any error can compromise the system security by letting unwanted traffic pass or blocking desired traffic.
 
 > [!WARNING]
-> Resolution applies the policy described below rather than keeping the input's first-match decisions, so a specific rule can override a broader one listed before it. Merging still has open bugs that make `--merge` crash on some inputs. Review resolved and merged rules before using them. See [Known Issues](#known-issues).
+> Resolution applies the policy described below rather than keeping the input's first-match decisions, so a specific rule can override a broader one listed before it. Merging is a separate step: `--merge` works on the rules as given, whether or not they have been resolved, so a completed merge doesn't mean the rules are free of anomalies. `--merge` can also still crash on some inputs. Review resolved and merged rules before using them. See [Known Issues](#known-issues).
 
 - [Usage](#usage)
 - [Relation Between Two Rules](#relation-between-two-rules)
@@ -147,7 +147,7 @@ Fixed since the audit:
 - [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) (Critical): values that don't parse are rejected with an error naming the line, instead of being read as `ANY`, TCP, `IN` or `DENY`.
 - [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
 - [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) (Critical): resolution decides each piece from the original rules that contain it, so a piece can no longer override the reject decision on a correlated overlap. Resolution also works on copies, so the caller's rules are no longer changed.
-- [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) (Critical): merging compares sibling subtrees with all their children, including children that share a range, so it no longer drops a rule.
+- [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) (Critical): merging compares the full set of rules below two sibling edges, including children that share a range, so it no longer drops a rule. If the two half ranges of the issue's example are listed before the full range, `merge()` still raises `KeyError` first ([#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7)).
 
 ### Medium
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.

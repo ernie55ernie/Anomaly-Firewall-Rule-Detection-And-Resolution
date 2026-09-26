@@ -147,10 +147,9 @@ Fixed since the audit:
 - [#2](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/2) (Critical): redundancy removal no longer deletes a rule when an overlapping rule with a different action comes before the rule that contains it.
 - [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) (Critical): values that don't parse are rejected with an error naming the line, instead of being read as `ANY`, TCP, `IN` or `DENY`.
 - [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
-- [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) (Critical): resolution decides each piece from the original rules that contain it, so a piece can no longer override the reject decision on a correlated overlap.
+- [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) (Critical): resolution decides each piece from the original rules that contain it, so a piece can no longer override the reject decision on a correlated overlap. Resolution also works on copies, so the caller's rules are no longer changed.
 
 ### Medium
-- `resolve_anomalies` modifies the caller's `Rule` objects in place, so the input list is corrupted after resolving.
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.
 - `--merge` runs on unresolved rules, but the rule tree ignores order, so the merged result may not match any ordering of the input.
 - The parser ignores text after `>`, so a second rule on the same line is lost.

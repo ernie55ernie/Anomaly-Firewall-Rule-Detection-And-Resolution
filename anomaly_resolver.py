@@ -495,18 +495,15 @@ class AnomalyResolver:
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \
 			'\n\t'.join(map(str, old_rules_list)))
 		new_rules_list = list()
-		# insert() and split() change the rules they are given, so keep copies
-		# of the originals to decide the action of each piece afterwards.
-		original_rules = list()
+		# insert() and split() change the rules they are given, so resolve
+		# copies. The caller's rules stay unchanged and decide the action of
+		# each piece afterwards.
 		for rule in old_rules_list:
-			original_rule = Rule()
-			original_rule.set_fields(rule)
-			original_rules.append(original_rule)
+			working_rule = Rule()
+			working_rule.set_fields(rule)
+			self.insert(working_rule, new_rules_list)
 
-		for rule in old_rules_list:
-			self.insert(rule, new_rules_list)
-
-		self.set_actions(new_rules_list, original_rules)
+		self.set_actions(new_rules_list, old_rules_list)
 		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
 		
@@ -526,13 +523,17 @@ class AnomalyResolver:
 		# overlap without either containing the other, DENY wins.
 		for rule in rules_list:
 			covering = [original for original in original_rules if rule.issubset(original)]
+			if not covering:
+				# Every piece comes from an original rule, so this is a bug in
+				# insert() or split(), not bad input.
+				raise RuntimeError('No original rule contains %s' % (rule,))
 			most_specific = [original for original in covering if not any(
 				other.issubset(original) and not original.issubset(other)
 				for other in covering)]
-			if not most_specific:
-				continue
+			# Fail closed: only an explicit ALLOW from every most specific
+			# rule allows, so an unexpected action value can't open traffic.
 			actions = set(original.actions for original in most_specific)
-			action = 'DENY' if 'DENY' in actions else 'ALLOW'
+			action = 'ALLOW' if actions == {'ALLOW'} else 'DENY'
 			if rule.actions != action:
 				self.resolver_logger.info('Set action of %s to %s', str(rule), action)
 				rule.actions = action
@@ -598,11 +599,10 @@ class AnomalyResolver:
 		'''
 		Resolve anomalies between two rules r and s
 		'''
+		# Actions are decided afterwards by set_actions(), so only the
+		# placement of the rules matters here.
 		if rule.issubset(subset_rule) and subset_rule.issubset(rule):
-			if not rule.actions == subset_rule.actions:
-				subset_rule.actions = 'DENY'
-			else:
-				self.resolver_logger.info('Remove rule %s' % (str(rule),))
+			self.resolver_logger.info('Remove rule %s' % (str(rule),))
 			return True
 		if rule.issubset(subset_rule):
 			self.resolver_logger.info('Reodering %s before %s' % \
@@ -619,8 +619,6 @@ class AnomalyResolver:
 
 		for attribute in attribute_set:
 			self.split(rule, subset_rule, attribute, new_rules_list)
-		if not rule.actions == subset_rule.actions:
-			subset_rule.actions = 'DENY'
 		self.insert(subset_rule, new_rules_list)
 		return True
 

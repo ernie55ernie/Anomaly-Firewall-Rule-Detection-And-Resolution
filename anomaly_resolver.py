@@ -6,8 +6,8 @@ import logging
 import os
 import tempfile
 
-from netaddr import IPSet, IPRange, IPNetwork, IPGlob
-from netaddr import valid_ipv4, valid_glob, glob_to_cidrs
+from netaddr import IPSet, IPRange, IPNetwork, IPGlob, IPAddress
+from netaddr import AddrFormatError, valid_ipv4, valid_glob, glob_to_cidrs
 import networkx as nx
 
 from utils import hierarchy_pos
@@ -38,30 +38,36 @@ class SimpleRuleParser(RuleParser):
 					raise ValueError(
 						'Invalid rule format on line %d: %s' % (line_number, raw_line.rstrip())
 					)
-				try:
-					priority = int(line[:line.find('.')].strip())
-				except ValueError as exc:
+				priority = line[:line.find('.')].strip()
+				if not (priority.isascii() and priority.isdecimal()):
 					raise ValueError(
 						'Invalid priority on line %d: %s' % (line_number, raw_line.rstrip())
-					) from exc
+					)
+				priority = int(priority)
 				rule_start = line.find('<')
 				rule_end = line.find('>')
 				rule_string = line[rule_start + 1:rule_end]
-				rule_string = rule_string.replace(' ', '')
-				fields = rule_string.split(',')
+				# Strip around each field only. Whitespace inside a field is left in
+				# place so it is rejected rather than joining two tokens into one.
+				fields = [field.strip() for field in rule_string.split(',')]
 				if len(fields) != 7:
 					raise ValueError(
 						'Expected 7 rule fields on line %d, got %d: %s'
 						% (line_number, len(fields), raw_line.rstrip())
 					)
-				rule = Rule(priority = priority,
-					direction = fields[0], 
-					nw_proto = fields[1], 
-					nw_src = fields[2], 
-					nw_dst = fields[4], 
-					tp_src = fields[3], 
-					tp_dst = fields[5], 
-					actions = fields[6])
+				try:
+					rule = Rule(priority = priority,
+						direction = fields[0],
+						nw_proto = fields[1],
+						nw_src = fields[2],
+						nw_dst = fields[4],
+						tp_src = fields[3],
+						tp_dst = fields[5],
+						actions = fields[6])
+				except ValueError as exc:
+					raise ValueError(
+						'%s on line %d: %s' % (exc, line_number, raw_line.rstrip())
+					) from exc
 				self.rules.append(rule)
 
 class Rule(ctypes.Structure):
@@ -124,59 +130,95 @@ class Rule(ctypes.Structure):
 			direction, actions)
 
 	def _sanity_check(value, field):
+		# A value that doesn't parse raises ValueError. Falling back to a default
+		# would silently widen a rule, e.g. a typo'd address becoming ANY.
 		if field == 'priority':
-			try:
-				if isinstance(value, int) and value >= 0 and value < 65536:
-					return value
-			except:
+			if isinstance(value, int) and not isinstance(value, bool) and \
+				0 <= value < 65536:
 				return value
+			raise ValueError('Invalid priority %r' % (value,))
+
+		error = 'Invalid %s value %r' % (
+			{'ipv4': 'IPv4', 'nw_proto': 'protocol'}.get(field, field), value)
+		# Non-ASCII digits and letters would otherwise pass isdecimal() or map
+		# onto keywords through upper(), such as a dotless i in 'ın'.
+		if not isinstance(value, str) or not value.isascii() or \
+			any(character.isspace() for character in value):
+			raise ValueError(error)
+		upper_value = value.upper()
+		wildcard = upper_value in ['ANY', '*']
 
 		if field == 'port':
-			if '-' in value and value != '0-65535':
-				first, second = value.split('-')
-				if first.isdigit() and second.isdigit():
-					return value
-			elif value.isdigit():
-				return value
-			return '*' # 'ANY' or '*' or '0-65535':
+			if wildcard:
+				return '*'
+			bounds = value.split('-')
+			if len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
+				low, high = int(bounds[0]), int(bounds[-1])
+				if low <= high <= 65535:
+					if (low, high) == (0, 65535):
+						return '*'
+					return Rule.portrange2str(range(low, high + 1))
+			raise ValueError(error)
 
 		if field == 'dl_type':
-			if value.upper() in ['ARP', 'IPv4', 'IPv6']:
-				return value.upper()
-			return 'IPv4'
+			dl_types = {name.upper(): name for name in ['ARP', 'IPv4', 'IPv6']}
+			if upper_value in dl_types:
+				return dl_types[upper_value]
+			raise ValueError(error)
 
 		if field == 'ipv4':
-			if '-' in value:
-				first, second = value.split('-')
-				if second.isdigit():
-					second = first[:first.rindex('.') + 1] + second
-				if valid_ipv4(first) and valid_ipv4(second):
-					return first + '-' + second
-			if valid_glob(value):
-				return str(glob_to_cidrs(value)[0]).replace('/32', '')
-			if valid_ipv4(value) or \
-				('/'in value and valid_ipv4(value[:value.find('/')])):
-				return value.replace('/32', '')
-			return '*' # 'ANY'
+			if wildcard:
+				return '*'
+			if value.count('-') == 1:
+				first, last = value.split('-')
+				if last.isdecimal() and '.' in first:
+					last = first[:first.rindex('.') + 1] + last
+				if valid_ipv4(first) and valid_ipv4(last) and \
+					IPAddress(first) <= IPAddress(last):
+					return first + '-' + last
+			if '/' in value:
+				# Only a prefix length, on the network address itself. Mask
+				# notation is ambiguous (/0.0.0.0 would mean any address), and host
+				# bits usually mean a typo, like /2 for /32, that widens the rule.
+				address, _, prefix = value.partition('/')
+				if valid_ipv4(address) and prefix.isdecimal() and int(prefix) <= 32:
+					network = IPNetwork('%s/%d' % (address, int(prefix)))
+					if network.ip == network.network:
+						return address if network.prefixlen == 32 else str(network.cidr)
+				raise ValueError(error)
+			try:
+				if valid_glob(value):
+					cidrs = glob_to_cidrs(value)
+					if len(cidrs) > 1:
+						# A glob such as 10.0.1-2.* covers several CIDR blocks.
+						glob = IPGlob(value)
+						return '%s-%s' % (glob[0], glob[-1])
+					if cidrs[0].prefixlen == 32:
+						return str(cidrs[0].ip)
+					return str(cidrs[0])
+			except (AddrFormatError, ValueError):
+				pass
+			raise ValueError(error)
 
 		if field == 'nw_proto':
-			if value.upper() in ['TCP', 'UDP', 'ICMP', 'ICMPv6']:
-				return value.upper()
-			return 'TCP'
+			protocols = {name.upper(): name for name in ['TCP', 'UDP', 'ICMP', 'ICMPv6']}
+			if upper_value in protocols:
+				return protocols[upper_value]
+			raise ValueError(error)
 
 		if field == 'direction':
-			if value.upper() in ['IN']:
-				return 'IN'
-			if value.upper() in ['OUT']:
-				return 'OUT'
-			return 'IN'
+			if upper_value in ['IN', 'OUT']:
+				return upper_value
+			raise ValueError(error)
 
 		if field == 'action':
-			if value.upper() in ['DENY', 'REJECT']:
+			if upper_value in ['DENY', 'REJECT']:
 				return 'DENY'
-			if value.upper() in ['ALLOW', 'ACCEPT']:
+			if upper_value in ['ALLOW', 'ACCEPT']:
 				return 'ALLOW'
-			return 'DENY'
+			raise ValueError(error)
+
+		raise ValueError('Unknown field %r' % (field,))
 
 	def __repr__(self, format='basic'):
 		if format == 'detail':

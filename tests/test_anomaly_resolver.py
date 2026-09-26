@@ -42,10 +42,125 @@ class ParserTests(unittest.TestCase):
 			handle.write('\n')
 			handle.write('1. <IN, TCP, ANY, ANY, ANY, 80, REJECT>\n')
 			path = handle.name
-		self.addCleanup(lambda: os.remove(path))
+		self.addCleanup(os.remove, path)
 
 		parsed = SimpleRuleParser(path)
 		self.assertEqual(len(parsed.rules), 1)
+
+	def parse(self, *lines):
+		with tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8') as handle:
+			handle.write(''.join(line + '\n' for line in lines))
+			path = handle.name
+		self.addCleanup(os.remove, path)
+		return SimpleRuleParser(path).rules
+
+	def test_invalid_value_names_the_line(self):
+		with self.assertRaises(ValueError) as error:
+			self.parse('1. <IN, TCP, ANY, ANY, ANY, 80, REJECT>',
+				'2. <IN, TCP, 129.110.96.300, ANY, 129.110.96.80, 22, ACCEPT>')
+		self.assertIn("Invalid IPv4 value '129.110.96.300' on line 2", str(error.exception))
+
+	def test_tab_separated_fields_are_parsed(self):
+		rules = self.parse('1.\t<IN,\tUDP,\t10.0.0.1,\tANY,\tANY,\t53,\tACCEPT>')
+		self.assertEqual(str(rules[0]), '<IN, UDP, 10.0.0.1, *, *, 53, ALLOW>')
+
+	def test_whitespace_inside_a_field_is_rejected(self):
+		# It used to be deleted, so '22 23' became port 2223.
+		for line, bad_value in [('1. <IN, TCP, 10.0.0.1, ANY, ANY, 22 23, ACCEPT>', "port value '22 23'"),
+			('1. <IN, TCP, 129.110.96.1\t17, ANY, ANY, 22, ACCEPT>', "IPv4 value '129.110.96.1\\t17'"),
+			('1. <IN, TCP, 10.0.0.1, ANY, ANY, 22, ACC EPT>', "action value 'ACC EPT'")]:
+			with self.subTest(line=line):
+				with self.assertRaises(ValueError) as error:
+					self.parse(line)
+				self.assertIn('Invalid %s on line 1' % bad_value, str(error.exception))
+
+	def test_priority_must_be_ascii_digits(self):
+		for priority in ['٥', '1_0', '+1', '-1']:
+			with self.subTest(priority=priority):
+				with self.assertRaises(ValueError) as error:
+					self.parse('%s. <IN, TCP, ANY, ANY, ANY, 80, REJECT>' % priority)
+				self.assertIn('Invalid priority on line 1', str(error.exception))
+
+
+class InputValidationTests(unittest.TestCase):
+
+	def test_values_that_do_not_parse_are_rejected(self):
+		# Issue #3: these used to become ANY, TCP, IN or DENY without a warning.
+		invalid = {
+			'nw_src': ['129.110.96.300', '129.110.96.1l7', '2001:db8::1', '10.*.0.*',
+				'', '10.0.0.1/33', '10.0.0.1/3200', '10.0.0.9-10.0.0.1', '10.0.0.9-1',
+				'10.0.0.1-10.0.0.2-3', 'abc-5', '010.0.0.1',
+				# Mask notation, signed or empty prefixes, and whitespace.
+				'10.0.0.0/255.255.255.0', '10.0.0.1/0.0.0.0', '10.0.0.0/0.0.0.255',
+				'10.0.0.1/-0', '10.0.0.1/+24', '10.0.0.0/', '10.0.0.0/24/8',
+				'10.0.0.0/ 24', ' 10.0.0.1', '١٠.0.0.1'],
+			'tp_dst': ['8O', '44E', '0x50', '', '-1', '1-', '70000', '1-70000', '80-20', '1-2-3',
+				'22 23', ' 80', '٨٠', '８０'],
+			'nw_proto': ['ANY', 'SCTP', '', 'ıcmp'],
+			'direction': ['INBOUND', '', 'ın'],
+			'actions': ['DROP', '', 'ACC EPT'],
+			'priority': [-1, 65536, '5', True],
+		}
+		for field, values in invalid.items():
+			for value in values:
+				with self.subTest(field=field, value=value):
+					with self.assertRaises(ValueError):
+						Rule(**{field: value})
+
+	def test_valid_values_are_normalized(self):
+		valid = [
+			('nw_src', 'ANY', '*'), ('nw_src', 'any', '*'), ('nw_src', '*', '*'),
+			('nw_src', '10.0.0.1', '10.0.0.1'), ('nw_src', '10.0.0.1/32', '10.0.0.1'),
+			('nw_src', '10.0.0.0/24', '10.0.0.0/24'), ('nw_src', '10.0.0.0/024', '10.0.0.0/24'),
+			('nw_src', '0.0.0.0/0', '0.0.0.0/0'),
+			('nw_src', '202.80.169.29-63', '202.80.169.29-202.80.169.63'),
+			('nw_src', '129.110.96.*', '129.110.96.0/24'),
+			('nw_src', '10.0.1-2.*', '10.0.1.0-10.0.2.255'),
+			('tp_dst', 'ANY', '*'), ('tp_dst', '0-65535', '*'), ('tp_dst', '80', '80'),
+			('tp_dst', '1000-2000', '1000-2000'), ('tp_dst', '65535', '65535'),
+			('nw_proto', 'udp', 'UDP'), ('nw_proto', 'ICMPv6', 'ICMPv6'),
+			('dl_type', 'ipv6', 'IPv6'), ('dl_type', 'IPv4', 'IPv4'),
+			('direction', 'out', 'OUT'), ('actions', 'accept', 'ALLOW'),
+			('actions', 'reject', 'DENY'), ('priority', 65535, 65535),
+		]
+		for field, value, expected in valid:
+			with self.subTest(field=field, value=value):
+				rule = Rule(**{field: value})
+				self.assertEqual(getattr(rule, field), expected)
+				# The stored value must also parse in the comparison code, which
+				# used to crash on values like 10.0.0.1/-0 that passed validation.
+				rule.disjoint(Rule())
+
+	def test_cidr_must_use_the_network_address(self):
+		# Host bits set outside the prefix usually mean a typo that widens the
+		# rule, as ipaddress.ip_network(value, strict=True) also rejects.
+		for value, expected in [('10.0.0.0/24', '10.0.0.0/24'), ('10.0.0.5/24', None),
+			('129.110.96.117/2', None), ('10.0.0.1/32', '10.0.0.1'),
+			('0.0.0.0/0', '0.0.0.0/0'), ('10.0.0.1/0', None)]:
+			with self.subTest(value=value):
+				if expected is None:
+					with self.assertRaises(ValueError):
+						Rule(nw_src=value)
+				else:
+					self.assertEqual(Rule(nw_src=value).nw_src, expected)
+
+	def test_port_ranges_are_stored_in_canonical_form(self):
+		# One spelling per range, since rules are also compared as text.
+		for value, expected in [('5-5', '5'), ('65535-65535', '65535'), ('00-65535', '*'),
+			('0-65535', '*'), ('0-65534', '0-65534'), ('080', '80'), ('0080-0090', '80-90')]:
+			with self.subTest(value=value):
+				self.assertEqual(Rule(tp_dst=value).tp_dst, expected)
+
+	def test_keywords_are_stored_in_canonical_spelling(self):
+		for field, value, expected in [('dl_type', 'arp', 'ARP'), ('dl_type', 'IPV6', 'IPv6'),
+			('nw_proto', 'Tcp', 'TCP'), ('nw_proto', 'icmpv6', 'ICMPv6'),
+			('direction', 'In', 'IN'), ('actions', 'Accept', 'ALLOW'), ('actions', 'Deny', 'DENY')]:
+			with self.subTest(field=field, value=value):
+				self.assertEqual(getattr(Rule(**{field: value}), field), expected)
+
+	def test_unknown_field_is_rejected(self):
+		with self.assertRaisesRegex(ValueError, "Unknown field 'ip'"):
+			Rule._sanity_check('10.0.0.1', 'ip')
 
 
 class ResolverTests(unittest.TestCase):
@@ -164,7 +279,9 @@ class RedundancyRemovalTests(unittest.TestCase):
 
 	def test_rule_with_an_empty_range_is_removed(self):
 		# A reversed port range matches nothing, so removing the rule is safe.
-		empty = Rule(nw_src='10.0.0.1', tp_dst='80-20', actions='DENY')
+		# Rule() rejects one, but assigning the field directly still works.
+		empty = Rule(nw_src='10.0.0.1', tp_dst='20-80', actions='DENY')
+		empty.tp_dst = '80-20'
 		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='1-100', actions='DENY')
 		kept = self.resolver.remove_redundant_rules([empty, subnet])
 		self.assertEqual(len(kept), 1)

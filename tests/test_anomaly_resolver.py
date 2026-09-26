@@ -238,6 +238,111 @@ class ResolveTests(unittest.TestCase):
 		self.assertEqual(sum(rule is existing for rule in rules), 1)
 
 
+class ConflictResolutionTests(unittest.TestCase):
+	# resolve_anomalies decides each packet from the original rules that match
+	# it: a rule strictly inside another wins, and among rules that overlap
+	# without nesting, DENY wins.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def decisions(self, rules, packets):
+		resolved = self.resolver.resolve_anomalies(rules)
+		return [first_match(resolved, Rule(nw_src=src, nw_dst=dst, tp_src='1', tp_dst=dport))
+			for src, dst, dport in packets]
+
+	def test_correlated_overlap_stays_denied(self):
+		# Issue #4: a piece of the third rule was moved in front of the DENY
+		# common part of the first two, so 10.0.1.100 became ALLOW.
+		rules = [Rule(nw_src='10.0.0.0/24', nw_dst='10.0.1.0-10.0.1.127', tp_dst='*', actions='DENY'),
+			Rule(nw_src='10.0.0.0/24', nw_dst='10.0.1.64-10.0.1.255', tp_dst='80', actions='ALLOW'),
+			Rule(nw_src='10.0.0.5', nw_dst='10.0.1.0/24', tp_dst='80', actions='ALLOW')]
+		self.assertEqual(self.decisions(rules, [('10.0.0.5', '10.0.1.10', '80'),
+			('10.0.0.5', '10.0.1.100', '80')]), ['DENY', 'DENY'])
+
+	def test_piece_inside_a_correlated_rule_is_denied(self):
+		# The first rule's piece for 10.0.1.1 lies inside the third rule, but
+		# the two original rules only overlap, so DENY wins there.
+		rules = [Rule(nw_src='10.0.0.3-10.0.0.5', nw_dst='10.0.1.1-10.0.1.3', tp_dst='1-4', actions='ALLOW'),
+			Rule(nw_src='10.0.0.0-10.0.0.7', nw_dst='10.0.1.2', tp_dst='1-4', actions='DENY'),
+			Rule(nw_src='10.0.0.0-10.0.0.7', nw_dst='10.0.1.0-10.0.1.2', tp_dst='1-4', actions='DENY')]
+		self.assertEqual(self.decisions(rules, [('10.0.0.3', '10.0.1.1', '1')]), ['DENY'])
+
+	def test_piece_equal_to_a_more_specific_rule_keeps_its_action(self):
+		# A piece of the first rule equals the third rule, but the third rule
+		# lies strictly inside the first, so its ALLOW wins.
+		rules = [Rule(nw_src='10.0.0.0-10.0.0.7', nw_dst='10.0.1.1', tp_dst='1-4', actions='DENY'),
+			Rule(nw_src='10.0.0.4-10.0.0.6', nw_dst='10.0.1.0-10.0.1.3', tp_dst='1-2', actions='DENY'),
+			Rule(nw_src='10.0.0.0-10.0.0.3', nw_dst='10.0.1.1', tp_dst='1-4', actions='ALLOW')]
+		self.assertEqual(self.decisions(rules, [('10.0.0.0', '10.0.1.1', '1')]), ['ALLOW'])
+
+	def test_resolved_decisions_follow_the_policy_for_random_rules(self):
+		# Checked with plain integer ranges rather than Rule.issubset. Explicit
+		# in_port and tp_src values keep the port checks small.
+		generator = random.Random(4)
+		base = {'nw_src': int(Rule.ipstr2range('10.0.0.0')[0]),
+			'nw_dst': int(Rule.ipstr2range('10.0.1.0')[0])}
+
+		def bounds(low, high):
+			if generator.random() < 0.5:
+				return low, high
+			first = generator.randrange(low, high + 1)
+			return first, generator.randrange(first, high + 1)
+
+		def random_rule():
+			fields = {'nw_src': bounds(0, 4), 'nw_dst': bounds(0, 2), 'tp_dst': bounds(1, 3),
+				'direction': generator.choice(['IN', 'IN', 'IN', 'OUT']),
+				'actions': generator.choice(['ALLOW', 'DENY'])}
+			rule = Rule(in_port='1', tp_src='1', direction=fields['direction'],
+				nw_src='10.0.0.%d-10.0.0.%d' % fields['nw_src'],
+				nw_dst='10.0.1.%d-10.0.1.%d' % fields['nw_dst'],
+				tp_dst='%d-%d' % fields['tp_dst'], actions=fields['actions'])
+			return rule, fields
+
+		def resolved_fields(rule):
+			fields = {'direction': rule.direction, 'actions': rule.actions}
+			for key in ['nw_src', 'nw_dst']:
+				addresses = Rule.ipstr2range(getattr(rule, key))
+				fields[key] = (int(addresses[0]) - base[key], int(addresses[-1]) - base[key])
+			ports = Rule.portstr2range(rule.tp_dst)
+			fields['tp_dst'] = (ports[0], ports[-1])
+			return fields
+
+		def matches(fields, packet):
+			return fields['direction'] == packet['direction'] and all(
+				fields[key][0] <= packet[key] <= fields[key][1]
+				for key in ['nw_src', 'nw_dst', 'tp_dst'])
+
+		def inside(inner, outer):
+			return inner['direction'] == outer['direction'] and all(
+				outer[key][0] <= inner[key][0] and inner[key][1] <= outer[key][1]
+				for key in ['nw_src', 'nw_dst', 'tp_dst'])
+
+		def expected(originals, packet):
+			matching = [fields for fields in originals if matches(fields, packet)]
+			most_specific = [fields for fields in matching if not any(
+				inside(other, fields) and not inside(fields, other) for other in matching)]
+			if not most_specific:
+				return None
+			return 'DENY' if any(fields['actions'] == 'DENY' for fields in most_specific) else 'ALLOW'
+
+		keys = ('direction', 'nw_src', 'nw_dst', 'tp_dst')
+		packets = [dict(zip(keys, values)) for values in itertools.product(
+			['IN', 'OUT'], range(6), range(4), range(5))]
+		for _ in range(150):
+			pairs = [random_rule() for _ in range(generator.randrange(2, 7))]
+			originals = [fields for _, fields in pairs]
+			resolved = [resolved_fields(rule)
+				for rule in self.resolver.resolve_anomalies([rule for rule, _ in pairs])]
+			for packet in packets:
+				got = next((fields['actions'] for fields in resolved if matches(fields, packet)), None)
+				self.assertEqual(got, expected(originals, packet),
+					'%s for %s -> %s' % (packet, originals, resolved))
+
+
 class RedundancyRemovalTests(unittest.TestCase):
 
 	def setUp(self):

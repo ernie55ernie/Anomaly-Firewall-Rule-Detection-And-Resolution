@@ -495,10 +495,18 @@ class AnomalyResolver:
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \
 			'\n\t'.join(map(str, old_rules_list)))
 		new_rules_list = list()
+		# insert() and split() change the rules they are given, so keep copies
+		# of the originals to decide the action of each piece afterwards.
+		original_rules = list()
+		for rule in old_rules_list:
+			original_rule = Rule()
+			original_rule.set_fields(rule)
+			original_rules.append(original_rule)
 
 		for rule in old_rules_list:
 			self.insert(rule, new_rules_list)
 
+		self.set_actions(new_rules_list, original_rules)
 		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
 		
@@ -506,6 +514,28 @@ class AnomalyResolver:
 			'\n\t'.join(map(str, new_rules_list)))
 		self.resolver_logger.info('Finish anomalies resolving')
 		return new_rules_list
+
+	def set_actions(self, rules_list, original_rules):
+		'''
+		Give each rule the action of the most specific original rules containing it
+		'''
+		# insert() decides conflicts between pieces of rules, and a piece can be
+		# inside, equal to or outside another piece when their original rules
+		# are related differently. Decide each piece from the original rules
+		# instead: a rule strictly inside another wins, and among rules that
+		# overlap without either containing the other, DENY wins.
+		for rule in rules_list:
+			covering = [original for original in original_rules if rule.issubset(original)]
+			most_specific = [original for original in covering if not any(
+				other.issubset(original) and not original.issubset(other)
+				for other in covering)]
+			if not most_specific:
+				continue
+			actions = set(original.actions for original in most_specific)
+			action = 'DENY' if 'DENY' in actions else 'ALLOW'
+			if rule.actions != action:
+				self.resolver_logger.info('Set action of %s to %s', str(rule), action)
+				rule.actions = action
 
 	def remove_redundant_rules(self, rules_list):
 		'''

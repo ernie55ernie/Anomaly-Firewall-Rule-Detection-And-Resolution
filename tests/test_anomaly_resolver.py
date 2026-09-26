@@ -133,6 +133,35 @@ class MergeTests(unittest.TestCase):
 		self.assertEqual(set(map(tuple, self.merge(rules))),
 			{('IN', 'TCP', '10.0.0.1-10.0.0.2', '1-10', '10.0.1.1', '80', 'ALLOW')})
 
+	# Contiguous sibling values and their merged range. The action edge is
+	# four levels below the sources and one level below the ports.
+	CONTIGUOUS_SIBLINGS = [('nw_src', ['10.0.0.1', '10.0.0.2'], '10.0.0.1-10.0.0.2'),
+		('tp_dst', ['80', '81'], '80-81')]
+
+	def sibling_rules(self, field, values, actions):
+		# Rules that are identical apart from `field` and their action.
+		base = {'nw_src': '10.0.0.1', 'tp_src': '1-10', 'nw_dst': '10.0.1.1', 'tp_dst': '80'}
+		return [Rule(actions=action, **dict(base, **{field: value}))
+			for value, action in zip(values, actions)]
+
+	def test_contiguous_siblings_with_different_actions_do_not_merge(self):
+		# The signature keeps each path's terminal action, so siblings whose
+		# paths differ only in ALLOW and DENY stay separate.
+		for field, values, _ in self.CONTIGUOUS_SIBLINGS:
+			with self.subTest(field=field):
+				paths = self.merge(self.sibling_rules(field, values, ['ALLOW', 'DENY']))
+				index = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst'].index(field)
+				self.assertEqual([(path[index], path[-1]) for path in paths],
+					[(values[0], 'ALLOW'), (values[1], 'DENY')])
+
+	def test_contiguous_siblings_with_the_same_action_merge(self):
+		for field, values, merged in self.CONTIGUOUS_SIBLINGS:
+			with self.subTest(field=field):
+				paths = self.merge(self.sibling_rules(field, values, ['ALLOW', 'ALLOW']))
+				expected = dict({'nw_src': '10.0.0.1', 'tp_dst': '80'}, **{field: merged})
+				self.assertEqual(paths, [['IN', 'TCP', expected['nw_src'], '1-10', '10.0.1.1',
+					expected['tp_dst'], 'ALLOW']])
+
 	def test_merging_keeps_every_rule_in_random_variants_of_issue_5(self):
 		# Each source gets a full tp_src range plus two halves that merge into
 		# it, with random destinations and actions. The full range always comes

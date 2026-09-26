@@ -4,7 +4,7 @@ This is an implementation of the [paper](https://link.springer.com/chapter/10.10
 Firewall rules define the security policy for network traffic. Any error can compromise the system security by letting unwanted traffic pass or blocking desired traffic.
 
 > [!WARNING]
-> The current code has known bugs that can turn denied traffic into allowed traffic and that silently read typos in a rules file as `ANY`. Review resolved rules before using them. See [Known Issues](#known-issues).
+> The current code has known bugs that can turn denied traffic into allowed traffic. Review resolved rules before using them. See [Known Issues](#known-issues).
 
 - [Usage](#usage)
 - [Relation Between Two Rules](#relation-between-two-rules)
@@ -75,8 +75,17 @@ This algorithm resolves the anomalies as follows:
 
 ## Illustrative Example of the Resolve Algorithm
 
-Firewall rules are expected in the following format: 
-- priority. <direction, source IP, source port, destination IP, destination port, actions>
+Firewall rules are expected in the following format:
+- priority. <direction, protocol, source IP, source port, destination IP, destination port, action>
+
+Accepted values, case-insensitive:
+- direction: `IN` or `OUT`
+- protocol: `TCP`, `UDP`, `ICMP` or `ICMPv6`
+- IP: `ANY` or `*`, an address (`10.0.0.1`), a CIDR block (`10.0.0.0/24`), a range (`10.0.0.1-10.0.0.9` or `10.0.0.1-9`), or a glob (`10.0.0.*`)
+- port: `ANY` or `*`, a port (`80`) or a range (`1000-2000`), within 0-65535
+- action: `ACCEPT` or `ALLOW`, `REJECT` or `DENY`
+
+Any other value is rejected with an error that names the line.
 ```
 1. <IN, TCP, 129.110.96.117, ANY, ANY, 80, REJECT>
 2. <IN, TCP, 129.110.96.*, ANY, ANY, 80, ACCEPT>
@@ -126,36 +135,30 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 ### Critical and high
 | Severity | Problem | Where | Issue |
 |---|---|---|---|
-| Critical | Unparseable IP and port values are read as `ANY`, and unknown protocols as TCP | `Rule._sanity_check` | [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) |
 | Critical | Resolving correlated rules can put an ALLOW piece in front of the DENY overlap | `resolve`, `split` | [#4](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/4) |
 | Critical | Merging can delete a DENY rule when two sibling edges have the same range | `subtree_equal` | [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) |
 | High | Resolve output changes between runs (depends on `PYTHONHASHSEED`) | `find_attribute_set` | [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) |
 | High | `--merge` raises `KeyError` at tree nodes with 3 or more children | `merge` | [#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7) |
 | High | `--merge` crashes on IP ranges ending at 255.255.255.255, including `rules/example_rules_1` | `Rule.contiguous` | [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) |
-| High | `ICMPv6` is read as TCP, and `dl_type` IPv6 as IPv4 | `Rule._sanity_check` | [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) |
 | High | Detection and resolution are slow: each wildcard port check builds a 65,536-element set | `Rule.portstr2range` | [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) |
 
 Fixed since the audit:
 - [#2](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/2) (Critical): redundancy removal no longer deletes a rule when an overlapping rule with a different action comes before the rule that contains it.
+- [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) (Critical): values that don't parse are rejected with an error naming the line, instead of being read as `ANY`, TCP, `IN` or `DENY`.
+- [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
 
 ### Medium
 - `resolve_anomalies` modifies the caller's `Rule` objects in place, so the input list is corrupted after resolving.
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.
 - `--merge` runs on unresolved rules, but the rule tree ignores order, so the merged result may not match any ordering of the input.
-- Parser gaps:
-  - A reversed port range (`80-20`) is accepted silently and becomes an empty range that matches nothing.
-  - Ports above 65535 are accepted.
-  - `.replace('/32', '')` turns `10.0.0.1/3200` into `10.0.0.100`.
-  - Text after `>` is ignored, so a second rule on the same line is lost.
-  - Tabs are not stripped.
-  - A glob such as `10.0.1-2.*` is cut down to its first /24.
+- The parser ignores text after `>`, so a second rule on the same line is lost.
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
-- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Only redundancy removal, the redundancy reports of detection and the list handling in `resolve()` are tested; the rest of detection, the insert and split steps of resolution, merging and input checking have no tests.
+- `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Only redundancy removal, the redundancy reports of detection, the list handling in `resolve()` and input checking are tested; the rest of detection, the insert and split steps of resolution, and merging have no tests.
 - The resolved list in [Illustrative Example of the Resolve Algorithm](#illustrative-example-of-the-resolve-algorithm) is out of date and contains shadowing anomalies itself. [Possible Anomalies Between Two Rules](#possible-anomalies-between-two-rules) says inclusive matches "reorder the one with the reject action", but the code moves the more specific rule first whatever its action.
 
 ### Low
-- The rule priority is parsed but ignored: file order decides, whereas in Ryu the higher priority wins. An out-of-range priority fails with an unclear ctypes `TypeError`, and resolved rules keep duplicate priorities.
+- The rule priority is parsed but ignored: file order decides, whereas in Ryu the higher priority wins. Resolved rules keep duplicate priorities.
 - Results appear only as INFO log lines. `main.py` discards the return value, and merging only produces PNG images.
 - Running `--merge` or `python anomaly_resolver.py` from the repository root overwrites the committed images in `img/`.
 - `main.py` prints a raw traceback for a missing file or a parse error.
@@ -163,7 +166,7 @@ Fixed since the audit:
 - `switch` or `vlan` set to `'all'` is treated as disjoint from a specific value. ICMP rules that have ports are treated as port-specific. A rules file with a UTF-8 BOM is rejected.
 - Plotting switches the global matplotlib backend and uses a predictable shared temp directory.
 - `requirements.txt` needs Python 3.11 or later, which isn't documented, and lists `pydot`, which is never used.
-- This README: the rule format line leaves out the protocol field, the Usage block is out of date, the Ryu firewall link in [Relation Between Two Rules](#relation-between-two-rules) is broken, and the blog post link returns 404.
+- This README: the Usage block is out of date, the Ryu firewall link in [Relation Between Two Rules](#relation-between-two-rules) is broken, and the blog post link returns 404.
 - `utils.hierarchy_pos` is licensed CC BY-SA (it comes from Stack Overflow), while the repository is licensed CC BY 4.0.
 
 ## Task List

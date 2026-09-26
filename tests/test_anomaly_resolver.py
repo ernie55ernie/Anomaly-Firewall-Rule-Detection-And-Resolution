@@ -1,6 +1,8 @@
 import itertools
 import os
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -431,6 +433,37 @@ class ResolveTests(unittest.TestCase):
 		self.assertTrue(self.resolver.resolve(overlapping, existing, rules))
 		self.assertEqual(sum(rule is twin for rule in rules), 1)
 		self.assertEqual(sum(rule is existing for rule in rules), 1)
+
+
+class SplitOrderTests(unittest.TestCase):
+
+	def test_rules_are_split_in_a_fixed_order(self):
+		rule = Rule(nw_src='10.0.0.1', tp_src='1', nw_dst='10.0.1.1', tp_dst='80')
+		other = Rule(in_port='3', nw_src='10.0.0.2', tp_src='2', nw_dst='10.0.1.2', tp_dst='81')
+		self.assertEqual(rule.find_attribute_set(other), ['tp_dst', 'nw_dst', 'tp_src', 'nw_src', 'in_port'])
+		self.assertEqual(rule.find_attribute_set(Rule(nw_src='10.0.0.2', tp_src='1',
+			nw_dst='10.0.1.1', tp_dst='81')), ['tp_dst', 'nw_src'])
+
+	def test_resolved_rules_are_the_same_under_every_hash_seed(self):
+		# Issue #6: the split order used to follow a set's iteration order,
+		# which changes with PYTHONHASHSEED. These two rules differ in three
+		# split attributes, and seeds 0, 1 and 3 gave three different results.
+		# The seed is fixed when Python starts, so each one needs its own
+		# process.
+		code = ("from anomaly_resolver import AnomalyResolver, Rule\n"
+			"rules = [Rule(in_port='1', tp_src='1', nw_src='10.0.0.0-10.0.0.7',\n"
+			"    nw_dst='10.0.1.0-10.0.1.3', tp_dst='1-4', actions='DENY'),\n"
+			"  Rule(in_port='1', tp_src='1', nw_src='10.0.0.2-10.0.0.5',\n"
+			"    nw_dst='10.0.1.2-10.0.1.6', tp_dst='2-6', actions='ALLOW')]\n"
+			"for rule in AnomalyResolver(log_level='CRITICAL').resolve_anomalies(rules):\n"
+			"    print(rule)\n")
+		root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+		outputs = set()
+		for seed in ['0', '1', '3', '4']:
+			environment = dict(os.environ, PYTHONHASHSEED=seed, PYTHONDONTWRITEBYTECODE='1')
+			outputs.add(subprocess.run([sys.executable, '-c', code], cwd=root, env=environment,
+				capture_output=True, text=True, check=True).stdout)
+		self.assertEqual(len(outputs), 1, outputs)
 
 
 class ConflictResolutionTests(unittest.TestCase):

@@ -151,14 +151,13 @@ class Rule(ctypes.Structure):
 		if field == 'port':
 			if wildcard:
 				return '*'
-			bounds = value.split('-')
-			if len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
-				low, high = int(bounds[0]), int(bounds[-1])
-				if low <= high <= 65535:
-					if (low, high) == (0, 65535):
-						return '*'
-					return Rule.portrange2str(range(low, high + 1))
-			raise ValueError(error)
+			try:
+				low, high = Rule.range_bounds('port', value)
+			except ValueError:
+				raise ValueError(error) from None
+			if (low, high) == (0, 65535):
+				return '*'
+			return Rule.portrange2str(range(low, high + 1))
 
 		if field == 'dl_type':
 			dl_types = {name.upper(): name for name in ['ARP', 'IPv4', 'IPv6']}
@@ -398,15 +397,13 @@ class Rule(ctypes.Structure):
 
 	def contiguous(r_1, r_2, attribute=None):
 		range_type = Rule._range_type(attribute, r_1, r_2)
-		if range_type == 'ip':
-			range_1 = Rule.ipstr2range(r_1)
-			range_2 = Rule.ipstr2range(r_2)
-		elif range_type == 'port':
-			range_1 = Rule.portstr2range(r_1)
-			range_2 = Rule.portstr2range(r_2)
-		else:
+		if range_type is None:
 			return False
-		return range_1[-1] + 1 == range_2[0] or range_1[0] == range_2[-1] + 1
+		# Compare integers: adding 1 to the IPAddress 255.255.255.255 raises
+		# IndexError, which made ANY and ranges ending there crash.
+		start_1, end_1 = Rule.range_bounds(range_type, r_1)
+		start_2, end_2 = Rule.range_bounds(range_type, r_2)
+		return end_1 + 1 == start_2 or end_2 + 1 == start_1
 
 	def combine_range(r_1, r_2, attribute=None):
 		range_type = Rule._range_type(attribute, r_1, r_2)
@@ -426,14 +423,22 @@ class Rule(ctypes.Structure):
 
 	def range_bounds(kind, value):
 		# The first and last value of an 'ip' or 'port' range, as integers.
-		# Ports are parsed directly, without portstr2range's list of values.
+		# Ports are parsed directly, without portstr2range's list of values, and
+		# checked as _sanity_check checks them since #3: a malformed range such
+		# as '80-' raises ValueError, and a reversed one such as '10-5' is not
+		# reordered.
 		if kind == 'ip':
 			addresses = Rule.ipstr2range(value)
 			return int(addresses[0]), int(addresses[-1])
 		if value == '*':
 			return 0, 65535
-		first, _, last = value.partition('-')
-		return int(first), int(last or first)
+		# isascii() because isdecimal() also accepts digits such as '٨٠'.
+		bounds = value.split('-') if isinstance(value, str) and value.isascii() else []
+		if 1 <= len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
+			low, high = int(bounds[0]), int(bounds[-1])
+			if low <= high <= 65535:
+				return low, high
+		raise ValueError('Invalid port range %r' % (value,))
 
 	def bounds_range(kind, start, end):
 		# The range string for integer bounds, written as split() writes ranges.

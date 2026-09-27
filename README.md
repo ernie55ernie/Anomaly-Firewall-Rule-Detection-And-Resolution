@@ -139,7 +139,6 @@ An audit of commit `67b819b` found the problems below. Each one was reproduced b
 ### Critical and high
 | Severity | Problem | Where | Issue |
 |---|---|---|---|
-| High | `Rule.contiguous` overflows on IP ranges ending at 255.255.255.255. Merging no longer calls it, so `--merge` doesn't crash | `Rule.contiguous` | [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) |
 | High | Detection and resolution are slow: each wildcard port check builds a 65,536-element set | `Rule.portstr2range` | [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) |
 
 Fixed since the audit:
@@ -150,6 +149,7 @@ Fixed since the audit:
 - [#5](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/5) (Critical): merging compares the full set of rules below two sibling edges, including children that share a range, so it no longer drops a rule.
 - [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) (High): rules are split on their attributes in a fixed order, so resolving gives the same rules on every run instead of depending on `PYTHONHASHSEED`.
 - [#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7) (High): merging groups sibling edges whose subtrees hold the same rules and joins their ranges wherever they overlap or touch, so it no longer raises `KeyError` at nodes with three or more children. The merged rules depend only on the rules themselves, not on the order they were inserted in.
+- [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) (High): `Rule.contiguous` compares integer bounds, so it no longer raises `IndexError` on ANY or on ranges that end at 255.255.255.255, and it gives the same answer in either argument order. Merging stopped calling it in #7's fix, so `--merge` already no longer crashed.
 
 ### Medium
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.

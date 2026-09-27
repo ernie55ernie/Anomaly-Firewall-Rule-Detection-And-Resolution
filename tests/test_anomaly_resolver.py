@@ -579,6 +579,20 @@ class ParserTests(unittest.TestCase):
 					self.parse(line)
 				self.assertIn('Invalid %s on line 1' % bad_value, str(error.exception))
 
+	def test_icmpv6_line_is_rejected(self):
+		# Issue #15: the rules file only has IPv4 addresses, so its rules are
+		# for IPv4 packets, and ICMPv6 runs over IPv6. The line became a rule
+		# that matches nothing, without a warning.
+		for protocol in ['ICMPv6', 'icmpv6']:
+			with self.subTest(protocol=protocol):
+				with self.assertRaises(ValueError) as error:
+					self.parse('1. <IN, %s, 10.0.0.1, ANY, ANY, ANY, ACCEPT>' % protocol,
+						'2. <IN, TCP, 10.0.0.1, ANY, ANY, ANY, REJECT>')
+				self.assertIn("ICMPv6 needs IPv6 addresses, which this rule format doesn't support "
+					'on line 1', str(error.exception))
+		rules = self.parse('1. <IN, ICMP, 10.0.0.1, ANY, ANY, ANY, ACCEPT>')
+		self.assertEqual((rules[0].nw_proto, rules[0].dl_type), ('ICMP', 'IPv4'))
+
 	def test_priority_must_be_ascii_digits(self):
 		for priority in ['٥', '1_0', '+1', '-1']:
 			with self.subTest(priority=priority):
@@ -623,7 +637,7 @@ class InputValidationTests(unittest.TestCase):
 			('nw_src', '10.0.1-2.*', '10.0.1.0-10.0.2.255'),
 			('tp_dst', 'ANY', '*'), ('tp_dst', '0-65535', '*'), ('tp_dst', '80', '80'),
 			('tp_dst', '1000-2000', '1000-2000'), ('tp_dst', '65535', '65535'),
-			('nw_proto', 'udp', 'UDP'), ('nw_proto', 'ICMPv6', 'ICMPv6'),
+			('nw_proto', 'udp', 'UDP'), ('nw_proto', 'ICMP', 'ICMP'),
 			('dl_type', 'ipv6', 'IPv6'), ('dl_type', 'IPv4', 'IPv4'),
 			('direction', 'out', 'OUT'), ('actions', 'accept', 'ALLOW'),
 			('actions', 'reject', 'DENY'), ('priority', 65535, 65535),
@@ -658,7 +672,7 @@ class InputValidationTests(unittest.TestCase):
 
 	def test_keywords_are_stored_in_canonical_spelling(self):
 		for field, value, expected in [('dl_type', 'arp', 'ARP'), ('dl_type', 'IPV6', 'IPv6'),
-			('nw_proto', 'Tcp', 'TCP'), ('nw_proto', 'icmpv6', 'ICMPv6'),
+			('nw_proto', 'Tcp', 'TCP'), ('nw_proto', 'icmp', 'ICMP'),
 			('direction', 'In', 'IN'), ('actions', 'Accept', 'ALLOW'), ('actions', 'Deny', 'DENY')]:
 			with self.subTest(field=field, value=value):
 				self.assertEqual(getattr(Rule(**{field: value}), field), expected)
@@ -1522,6 +1536,21 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 			with self.subTest(fields=fields):
 				rule = Rule(**fields)
 				self.assertEqual(dict((field, getattr(rule, field)) for field in fields), fields)
+
+	def test_icmp_version_must_match_dl_type(self):
+		# ICMP runs over IPv4 and ICMPv6 over IPv6, so any other combination
+		# matches nothing. TCP and UDP run over both.
+		for fields in [dict(nw_proto='ICMPv6'), dict(dl_type='IPv4', nw_proto='ICMPv6'),
+				dict(dl_type='IPv6', nw_proto='ICMP'), dict(dl_type='ARP', nw_proto='ICMP'),
+				dict(dl_type='ARP', nw_proto='ICMPv6')]:
+			with self.subTest(fields=fields):
+				with self.assertRaises(ValueError):
+					Rule(**fields)
+		for fields, expected in [(dict(dl_type='IPv6', nw_proto='icmpv6'), 'ICMPv6'),
+				(dict(nw_proto='icmp'), 'ICMP'), (dict(dl_type='IPv4', nw_proto='ICMP'), 'ICMP'),
+				(dict(dl_type='IPv6', nw_proto='UDP'), 'UDP'), (dict(dl_type='IPv6', nw_proto='TCP'), 'TCP')]:
+			with self.subTest(fields=fields):
+				self.assertEqual(Rule(**fields).nw_proto, expected)
 
 	def test_rules_with_the_wrong_address_family_cannot_be_built(self):
 		# An IPv6 source on the default IPv4 rule counted as disjoint from the

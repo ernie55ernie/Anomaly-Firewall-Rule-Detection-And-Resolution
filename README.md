@@ -82,7 +82,7 @@ Firewall rules are expected in the following format:
 
 Accepted values, which are case-insensitive ASCII with no whitespace inside:
 - direction: `IN` or `OUT`
-- protocol: `TCP`, `UDP`, `ICMP` or `ICMPv6`
+- protocol: `TCP`, `UDP` or `ICMP`. `ICMPv6` is rejected: it runs over IPv6, and the addresses in this format are IPv4.
 - IP: `ANY` or `*`, an address (`10.0.0.1`), a CIDR block (`10.0.0.0/24`), a range (`10.0.0.1-10.0.0.9` or `10.0.0.1-9`), or a glob (`10.0.0.*`). A CIDR block needs a prefix length from 0 to 32 on the network address itself: `10.0.0.5/24` and mask notation such as `10.0.0.0/255.255.255.0` are rejected.
 - port: `ANY` or `*`, a port (`80`) or a range (`1000-2000`), within 0-65535
 - action: `ACCEPT` or `ALLOW`, `REJECT` or `DENY`
@@ -122,7 +122,7 @@ Rules built in code can also name a switch or a VLAN. The rules file has neither
 In code, `Rule()` also takes an Ethernet type in `dl_type` (`ARP`, `IPv4` or `IPv6`), MAC addresses in `dl_src` and `dl_dst`, and IPv6 addresses in `ipv6_src` and `ipv6_dst`. The rules file has none of these, so parsed rules are IPv4 rules for any MAC or IPv6 address.
 - A MAC address is `*` or six pairs of hex digits separated by colons. It is stored in lower case, so each address has one spelling.
 - An IPv6 value is `*`, an address, a range, or a CIDR block on its network address. It is stored in compressed form, and a zone such as `%eth0` is rejected.
-- IPv4 addresses need `dl_type` `IPv4`, the default, and IPv6 addresses need `dl_type` `IPv6`. Any other combination could match nothing, so it is rejected.
+- IPv4 addresses and `ICMP` need `dl_type` `IPv4`, the default. IPv6 addresses and `ICMPv6` need `dl_type` `IPv6`. Any other combination could match nothing, so it is rejected.
 - Rules for different Ethernet types never overlap.
 - IPv6 ranges are compared and split like IPv4 ranges.
 - MAC addresses are handled like switches: `*` holds every address, and each MAC address that a rule names is resolved separately.

@@ -84,7 +84,7 @@ Accepted values, which are case-insensitive ASCII with no whitespace inside:
 - direction: `IN` or `OUT`
 - protocol: `TCP`, `UDP`, `ICMP` or `ICMPv6`. The addresses in this format are IPv4, but ICMPv6 runs over IPv6 only. So an `ICMPv6` line with `ANY` source and destination is read as an IPv6 rule, because its protocol alone decides the network family. An `ICMPv6` line with an IPv4 address is rejected.
 - IP: `ANY` or `*`, an address (`10.0.0.1`), a CIDR block (`10.0.0.0/24`), a range (`10.0.0.1-10.0.0.9` or `10.0.0.1-9`), or a glob (`10.0.0.*`). A CIDR block needs a prefix length from 0 to 32 on the network address itself: `10.0.0.5/24` and mask notation such as `10.0.0.0/255.255.255.0` are rejected.
-- port: `ANY` or `*`, a port (`80`) or a range (`1000-2000`), within 0-65535. Only TCP and UDP have ports, so an `ICMP` or `ICMPv6` line needs `ANY` ports.
+- port: `ANY` or `*`, a port (`80`) or a range (`1000-2000`), within 0-65535. This project treats the port fields as TCP and UDP transport ports: ICMP and ICMPv6 type and code aren't represented through them. So on an `ICMP` or `ICMPv6` line the ports must not constrain the rule. `ANY`, `*` or `0-65535` are accepted, and any specific port or range is rejected.
 - action: `ACCEPT` or `ALLOW`, `REJECT` or `DENY`
 
 Any other value is rejected with an error that names the line.
@@ -124,7 +124,7 @@ In code, `Rule()` also takes an Ethernet type in `dl_type` (`ARP`, `IPv4` or `IP
 - An IPv6 value is `*`, an address, a range, or a CIDR block on its network address. It is stored in compressed form, and a zone such as `%eth0` is rejected.
 - IPv4 addresses and `ICMP` need `dl_type` `IPv4`, the default. IPv6 addresses and `ICMPv6` need `dl_type` `IPv6`. A rule that mixes the two families, or whose `dl_type` doesn't match them, could match nothing, so it is rejected.
 - ARP packets carry no IP protocol and no ports, so an ARP rule has neither: its `nw_proto` and ports are `*`. A specific protocol or port range on an ARP rule is rejected. The forms that don't constrain the rule are accepted: `ANY` or `*` for the protocol, and `ANY`, `*` or `0-65535` for a port.
-- ICMP and ICMPv6 messages have no ports either. A specific port range on an ICMP or ICMPv6 rule is rejected, while `ANY`, `*` or `0-65535` is accepted.
+- `tp_src` and `tp_dst` are TCP and UDP transport ports, and ICMP and ICMPv6 type and code aren't represented through them. So a specific port range on an ICMP or ICMPv6 rule is rejected, because the field doesn't apply, while `ANY`, `*` or `0-65535` is accepted.
 - Other rules default to `TCP` when `nw_proto` is left out, and need a real protocol, so `ANY` and `*` are rejected for them. An explicit `nw_proto=None` is rejected for every rule, ARP included.
 - Rules for different Ethernet types never overlap.
 - IPv6 ranges are compared and split like IPv4 ranges.

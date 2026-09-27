@@ -119,6 +119,13 @@ Running `--detect` on this list still reports two "Shadowing Anomaly" entries: t
 
 Rules built in code can also name a switch or a VLAN. The rules file has neither, so parsed rules apply to `all`. As in Ryu, a rule for `all` applies on every switch and for every VLAN. So it overlaps a rule for one switch, and the rule for one switch is the more specific of the two. Resolution can't split a rule for `all` into one switch and the rest. Instead it resolves each switch and VLAN that some rule names separately, with working copies of the rules for `all` narrowed to it, and then the rules for `all` for the switches and VLANs that no rule names. The copies only place the pieces: each piece's action still comes from the original rules, with the switch and VLAN they were written for. The output lists the more specific rules first. Every named switch and VLAN gets a copy of the rules for `all`, so the number of resolved rules can multiply (see [Known Issues](#known-issues)).
 
+In code, `Rule()` also takes an Ethernet type in `dl_type` (`ARP`, `IPv4` or `IPv6`), MAC addresses in `dl_src` and `dl_dst`, and IPv6 addresses in `ipv6_src` and `ipv6_dst`. The rules file has none of these, so parsed rules are IPv4 rules for any MAC or IPv6 address.
+- A MAC address is `*` or six pairs of hex digits separated by colons. It is stored in lower case, so each address has one spelling.
+- An IPv6 value is `*`, an address, a range, or a CIDR block on its network address. It is stored in compressed form, and a zone such as `%eth0` is rejected.
+- Rules for different Ethernet types never overlap.
+- IPv6 ranges are compared and split like IPv4 ranges.
+- MAC addresses are handled like switches: `*` holds every address, and each MAC address that a rule names is resolved separately.
+
 ## Illustrative Example of the Merge Algorithm
 ```
 1. <IN, TCP, 202.80.169.29-63, 483, 129.110.96.64-127, 100-110, ACCEPT>
@@ -155,8 +162,8 @@ None are open. Fixed since the audit:
 - `--merge` runs on unresolved rules, but the rule tree ignores order, so the merged result may not match any ordering of the input.
 - The parser ignores text after `>`, so a second rule on the same line is lost.
 - The rule tree compares ranges as text, so `x.x.x.0/24` and `x.x.x.0-x.x.x.255` never merge.
-- The rule tree ignores `switch`, `vlan` and `in_port`, so `--merge` treats rules built in code for different switches or ports as the same. Parsed rules never set these fields.
-- Resolution copies every rule for `all` into each switch and VLAN that some rule names, even rules that overlap nothing specific to it. `example_rules_1` plus 10 switch-specific and 10 VLAN-specific host rules resolves to 511 rules in 2.2 s ([#33](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/33)).
+- The rule tree ignores `switch`, `vlan`, `in_port`, `dl_type`, `dl_src`, `dl_dst`, `ipv6_src` and `ipv6_dst`. So `--merge` treats rules built in code that differ only in these fields as the same. Parsed rules never set them.
+- Resolution copies every rule for `all`, and every rule for any MAC address, into each switch, VLAN and MAC address that some rule names, even rules that overlap nothing specific to it. `example_rules_1` plus 10 switch-specific and 10 VLAN-specific host rules resolves to 511 rules in 2.2 s ([#33](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/33)).
 - Each `AnomalyResolver` gets a logger named after `id(self)`. Python reuses ids, so handlers pile up and later instances log every line several times.
 - `python -m unittest` run from the repository root finds 0 tests (use `python -m unittest discover -s tests`). Resolution, merging and input checking are tested. Detection is tested for its redundancy reports, and for shadowing and correlation across switches; its other reports have no tests.
 
@@ -182,7 +189,8 @@ None are open. Fixed since the audit:
 - [x] tree_insert function which inserts rule r into the node n of the rule tree
 - [x] merge function which merges edges of node n representing a continuous range
 - [ ] IP range representation to multiple CIDR representations
-- [ ] Support for handling dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple nw_proto
+- [x] Support for handling dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst
+- [ ] Support for multiple nw_proto
 - [ ] Output resolved and merged rules to firewall rules file
 
 ### More about this program

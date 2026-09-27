@@ -115,7 +115,11 @@ class Rule(ctypes.Structure):
 
 		priority = Rule._sanity_check(priority, field = 'priority')
 		in_port = Rule._sanity_check(in_port, field = 'port')
+		dl_src = Rule._sanity_check(dl_src, field = 'mac')
+		dl_dst = Rule._sanity_check(dl_dst, field = 'mac')
 		dl_type = Rule._sanity_check(dl_type, field = 'dl_type')
+		ipv6_src = Rule._sanity_check(ipv6_src, field = 'ipv6')
+		ipv6_dst = Rule._sanity_check(ipv6_dst, field = 'ipv6')
 		nw_src = Rule._sanity_check(nw_src, field = 'ipv4')
 		nw_dst = Rule._sanity_check(nw_dst, field = 'ipv4')
 		nw_proto = Rule._sanity_check(nw_proto, field = 'nw_proto')
@@ -139,7 +143,8 @@ class Rule(ctypes.Structure):
 			raise ValueError('Invalid priority %r' % (value,))
 
 		error = 'Invalid %s value %r' % (
-			{'ipv4': 'IPv4', 'nw_proto': 'protocol'}.get(field, field), value)
+			{'ipv4': 'IPv4', 'ipv6': 'IPv6', 'mac': 'MAC', 'nw_proto': 'protocol'}.get(field, field),
+			value)
 		# Non-ASCII digits and letters would otherwise pass isdecimal() or map
 		# onto keywords through upper(), such as a dotless i in 'ın'.
 		if not isinstance(value, str) or not value.isascii() or \
@@ -199,6 +204,42 @@ class Rule(ctypes.Structure):
 				pass
 			raise ValueError(error)
 
+		if field == 'mac':
+			# Six pairs of hex digits, as Ryu takes them, in lower case so that
+			# one address has one spelling.
+			if wildcard:
+				return '*'
+			octets = value.lower().split(':')
+			if len(octets) == 6 and all(len(octet) == 2 and
+				set(octet) <= set('0123456789abcdef') for octet in octets):
+				return ':'.join(octets)
+			raise ValueError(error)
+
+		if field == 'ipv6':
+			# An address, a range or a CIDR block on its network address, as for
+			# IPv4, written in netaddr's compressed form. netaddr drops a zone
+			# such as '%eth0', which a rule can't match, so it is rejected.
+			if wildcard:
+				return '*'
+			if '%' in value:
+				raise ValueError(error)
+			try:
+				if value.count('-') == 1:
+					first, last = (IPAddress(address, 6) for address in value.split('-'))
+					if first <= last:
+						return str(first) if first == last else '%s-%s' % (first, last)
+				elif '/' in value:
+					address, _, prefix = value.partition('/')
+					if prefix.isdecimal() and int(prefix) <= 128:
+						network = IPNetwork('%s/%d' % (IPAddress(address, 6), int(prefix)))
+						if network.ip == network.network:
+							return str(network.ip) if network.prefixlen == 128 else str(network.cidr)
+				else:
+					return str(IPAddress(value, 6))
+			except (AddrFormatError, ValueError):
+				pass
+			raise ValueError(error)
+
 		if field == 'nw_proto':
 			protocols = {name.upper(): name for name in ['TCP', 'UDP', 'ICMP', 'ICMPv6']}
 			if upper_value in protocols:
@@ -241,11 +282,15 @@ class Rule(ctypes.Structure):
 		return self.issubset(rhs) and rhs.issubset(self)
 
 	def disjoint(self, subset_rule):
-		# TODO support for
-		# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
+		# TODO support for multiple protocols
 		if Rule.scopedisjoint(self.switch, subset_rule.switch) or \
 			Rule.scopedisjoint(self.vlan, subset_rule.vlan) or \
 			Rule.portdisjoint(self.in_port, subset_rule.in_port) or \
+			Rule.scopedisjoint(self.dl_src, subset_rule.dl_src, '*') or \
+			Rule.scopedisjoint(self.dl_dst, subset_rule.dl_dst, '*') or \
+			not self.dl_type == subset_rule.dl_type or \
+			Rule.ipv6disjoint(self.ipv6_src, subset_rule.ipv6_src) or \
+			Rule.ipv6disjoint(self.ipv6_dst, subset_rule.ipv6_dst) or \
 			Rule.ipdisjoint(self.nw_src, subset_rule.nw_src) or \
 			Rule.ipdisjoint(self.nw_dst, subset_rule.nw_dst) or \
 			not self.nw_proto == subset_rule.nw_proto or \
@@ -256,11 +301,15 @@ class Rule(ctypes.Structure):
 		return False
 
 	def issubset(self, subset_rule):
-		# TODO support for
-		# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
+		# TODO support for multiple protocols
 		if Rule.scopeinrange(self.switch, subset_rule.switch) and \
 			Rule.scopeinrange(self.vlan, subset_rule.vlan) and \
 			Rule.portinrange(self.in_port, subset_rule.in_port) and \
+			Rule.scopeinrange(self.dl_src, subset_rule.dl_src, '*') and \
+			Rule.scopeinrange(self.dl_dst, subset_rule.dl_dst, '*') and \
+			self.dl_type == subset_rule.dl_type and \
+			Rule.ipv6inrange(self.ipv6_src, subset_rule.ipv6_src) and \
+			Rule.ipv6inrange(self.ipv6_dst, subset_rule.ipv6_dst) and \
 			Rule.ipinrange(self.nw_src, subset_rule.nw_src) and \
 			Rule.ipinrange(self.nw_dst, subset_rule.nw_dst) and \
 			self.nw_proto == subset_rule.nw_proto and \
@@ -270,13 +319,14 @@ class Rule(ctypes.Structure):
 			return True
 		return False
 
-	def scopeinrange(first, second):
-		# A switch or VLAN: an ID, or 'all'. Ryu installs a rule posted to
-		# 'all' on every switch, or for every VLAN, so 'all' holds every ID.
-		return second == 'all' or first == second
+	def scopeinrange(first, second, everything='all'):
+		# A switch, VLAN or MAC address: one value, or the value for every one.
+		# Ryu installs a rule posted to 'all' on every switch, or for every
+		# VLAN, so 'all' holds every ID; for MAC addresses it is '*'.
+		return second == everything or first == second
 
-	def scopedisjoint(first, second):
-		return first != second and 'all' not in (first, second)
+	def scopedisjoint(first, second, everything='all'):
+		return first != second and everything not in (first, second)
 
 	def portinrange(first, second):
 		# Compare bounds: building sets of values took milliseconds for '*',
@@ -311,6 +361,16 @@ class Rule(ctypes.Structure):
 		second_low, second_high = Rule.range_bounds('ip', second)
 		return second_low <= first_low and first_high <= second_high
 
+	def ipv6inrange(first, second):
+		first_low, first_high = Rule.range_bounds('ipv6', first)
+		second_low, second_high = Rule.range_bounds('ipv6', second)
+		return second_low <= first_low and first_high <= second_high
+
+	def ipv6disjoint(first, second):
+		first_low, first_high = Rule.range_bounds('ipv6', first)
+		second_low, second_high = Rule.range_bounds('ipv6', second)
+		return first_high < second_low or second_high < first_low
+
 	def portdisjoint(first, second):
 		first_low, first_high = Rule.range_bounds('port', first)
 		second_low, second_high = Rule.range_bounds('port', second)
@@ -328,7 +388,7 @@ class Rule(ctypes.Structure):
 		# A list, not a set: a set of strings iterates in an order that changes
 		# with PYTHONHASHSEED, which made the resolved rules differ between
 		# runs. Splitting on the destination first tends to give fewer pieces.
-		attributes = ['tp_dst', 'nw_dst', 'tp_src', 'nw_src', 'in_port']
+		attributes = ['tp_dst', 'nw_dst', 'tp_src', 'nw_src', 'in_port', 'ipv6_dst', 'ipv6_src']
 		return [attribute for attribute in attributes
 			if getattr(self, attribute) != getattr(subset_rule, attribute)]
 
@@ -358,21 +418,23 @@ class Rule(ctypes.Structure):
 				new_str = '%d' % (new_range[0], )
 			setattr(self, attribute, new_str)
 		else:
+			# Bounds are integers, so name the version: a small IPv6 address
+			# would otherwise be read as IPv4.
+			version = 6 if attribute in ('ipv6_src', 'ipv6_dst') else 4
 			if offset == -1:
-				new_range = IPRange(start, end - 1)
+				end = end - 1
 			elif offset == 1:
-				new_range = IPRange(start + 1, end)
-			else:
-				new_range = IPRange(start, end)
-			new_range = Rule.iprange2str(new_range)
+				start = start + 1
+			new_range = Rule.iprange2str(IPRange(IPAddress(start, version), IPAddress(end, version)))
 			setattr(self, attribute, new_range)
 
 	def iprange2str(ip_range):
-		if len(ip_range) > 1:
-			end = str(ip_range[-1])
-			return '%s-%s' % (str(ip_range[0]), end) # end[end.rindex('.') + 1:]
-		else:
-			return str(ip_range[0])
+		# first and last rather than len(), which netaddr refuses for more than
+		# sys.maxsize addresses, as in most IPv6 ranges.
+		first = IPAddress(ip_range.first, ip_range.version)
+		if ip_range.first != ip_range.last:
+			return '%s-%s' % (first, IPAddress(ip_range.last, ip_range.version))
+		return str(first)
 
 	def ipstr2range(ip_str, format='range'):
 		init = IPRange if format == 'range' else IPSet
@@ -439,6 +501,15 @@ class Rule(ctypes.Structure):
 		# checked as _sanity_check checks them since #3: a malformed range such
 		# as '80-' raises ValueError, and a reversed one such as '10-5' is not
 		# reordered.
+		if kind == 'ipv6':
+			# '*', an address, a range or a CIDR block, with prefixes as ranges.
+			if value == '*':
+				return 0, 2 ** 128 - 1
+			first, _, last = value.partition('-')
+			addresses = IPRange(first, last) if last else IPNetwork(value)
+			if addresses.version != 6:
+				raise ValueError('Invalid IPv6 range %r' % (value,))
+			return addresses.first, addresses.last
 		if kind == 'ip':
 			addresses = Rule.ipstr2range(value)
 			# nw_src and nw_dst hold IPv4 only. Bounds are bare integers, so an
@@ -469,6 +540,10 @@ class AnomalyResolver:
 	# dl_src, dl_dst, dl_type, ipv6_src, ipv6_dst, multiple protocol
 	attr_list = ['direction', 'nw_proto', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions', 'None']
 	attr_dict = {}
+	# Fields that resolution can't split, each with the value that stands for
+	# every value: 'all switches except 1' isn't a rule. Each combination of
+	# the values that rules name is resolved separately instead.
+	scope_fields = [('switch', 'all'), ('vlan', 'all'), ('dl_src', '*'), ('dl_dst', '*')]
 	tree = None
 
 	def __init__(self, log_output = 'console', log_level = 'INFO'):
@@ -537,22 +612,24 @@ class AnomalyResolver:
 			'\n\t'.join(map(str, old_rules_list)))
 		new_rules_list = list()
 		scopes = self.scopes(old_rules_list)
-		for switch, vlan in scopes:
+		for scope in scopes:
 			if len(scopes) > 1:
-				self.resolver_logger.info('Resolving switch %s, vlan %s', switch, vlan)
+				self.resolver_logger.info('Resolving %s', ', '.join('%s %s' % (field, value)
+					for (field, _), value in zip(self.scope_fields, scope)))
 			# insert() and split() change the rules they are given, so resolve
-			# copies: copies of the rules that apply on this switch and VLAN,
-			# narrowed to it, as the pieces of a rule for 'all' can't be split
-			# by switch or VLAN. The narrowing only places the pieces. The
-			# caller's rules, unchanged and with the switch and VLAN they were
+			# copies: copies of the rules that apply to this switch, VLAN and
+			# MAC addresses, narrowed to them, as the pieces of a rule for 'all'
+			# can't be split by switch. The narrowing only places the pieces.
+			# The caller's rules, unchanged and with the values they were
 			# written for, decide the action of each piece afterwards: a rule
 			# for one switch is more specific than the same rule for 'all'.
 			pieces = list()
 			for rule in old_rules_list:
-				if Rule.scopeinrange(switch, rule.switch) and Rule.scopeinrange(vlan, rule.vlan):
+				if self.applies(rule, scope):
 					working_rule = Rule()
 					working_rule.set_fields(rule)
-					working_rule.switch, working_rule.vlan = switch, vlan
+					for (field, _), value in zip(self.scope_fields, scope):
+						setattr(working_rule, field, value)
 					self.insert(working_rule, pieces)
 			self.set_actions(pieces, old_rules_list)
 			new_rules_list.extend(pieces)
@@ -565,33 +642,50 @@ class AnomalyResolver:
 		return new_rules_list
 
 	@staticmethod
+	@staticmethod
+	def applies(rule, scope):
+		'''
+		Whether rule applies to scope, a value for each of scope_fields
+		'''
+		return all(Rule.scopeinrange(value, getattr(rule, field), everything)
+			for (field, everything), value in zip(AnomalyResolver.scope_fields, scope))
+
+	@staticmethod
 	def scopes(rules_list):
 		'''
-		The (switch, vlan) pairs to resolve separately, most specific first
+		The values of scope_fields to resolve separately, most specific first
 		'''
-		# Each switch and VLAN that a rule names is resolved with the rules
-		# for 'all' added, and 'all' stands for the ones no rule names. The
-		# resolved rules for a pair decide every packet there that any rule
-		# matches, so pairs with more named parts come first, and each later
-		# pair only decides packets that no earlier pair covers.
-		def named(values):
-			# IDs are strings, but a field can also hold None, which sorts first.
-			return sorted(set(values) - {'all'},
-				key=lambda value: (value is not None, value or '')) + ['all']
+		# Each switch, VLAN and MAC address that a rule names is resolved with
+		# the rules for every value added, such as the rules for 'all', and
+		# the value for every value stands for the ones no rule names. The
+		# resolved rules for a combination decide every packet there that any
+		# rule matches, so combinations with more named values come first,
+		# and each later one only decides packets no earlier one covers.
+		fields = AnomalyResolver.scope_fields
+
+		def named(field, everything):
+			# Values are strings, but a field can also hold None, which sorts
+			# first.
+			values = set(getattr(rule, field) for rule in rules_list) - {everything}
+			return sorted(values, key=lambda value: (value is not None, value or '')) + [everything]
 
 		def applicable(scope):
 			return frozenset(index for index, rule in enumerate(rules_list)
-				if Rule.scopeinrange(scope[0], rule.switch) and Rule.scopeinrange(scope[1], rule.vlan))
+				if AnomalyResolver.applies(rule, scope))
 
-		pairs = sorted(itertools.product(named(rule.switch for rule in rules_list),
-			named(rule.vlan for rule in rules_list)), key=lambda scope: scope.count('all'))
-		# A pair adds nothing when every rule for it also applies to the first
-		# later pair that covers it, which then decides its packets the same
-		# way. So rules for 'all' alone never make a pair of their own.
+		def covers(general, specific):
+			return all(Rule.scopeinrange(value, other, everything)
+				for (_, everything), value, other in zip(fields, specific, general))
+
+		combinations = sorted(itertools.product(*[named(field, everything)
+			for field, everything in fields]), key=lambda scope: sum(value == everything
+			for (_, everything), value in zip(fields, scope)))
+		# A combination adds nothing when every rule for it also applies to
+		# the first later combination that covers it, which then decides its
+		# packets the same way. So rules for 'all' alone never make one.
 		kept = list()
-		for scope in reversed(pairs):
-			fallback = next((later for later in kept if Rule.scopeinrange(scope[0], later[0])
-				and Rule.scopeinrange(scope[1], later[1])), None)
+		for scope in reversed(combinations):
+			fallback = next((later for later in kept if covers(later, scope)), None)
 			if fallback is None or applicable(scope) != applicable(fallback):
 				kept.insert(0, scope)
 		return kept
@@ -722,7 +816,8 @@ class AnomalyResolver:
 		'''
 		self.resolver_logger.info('Overlapping rule %s, %s' % (str(rule), str(subset_rule)))
 		# Integer bounds, rather than get_attribute_range's list of every port.
-		kind = 'ip' if attribute in ('nw_src', 'nw_dst') else 'port'
+		kind = {'nw_src': 'ip', 'nw_dst': 'ip', 'ipv6_src': 'ipv6', 'ipv6_dst': 'ipv6'}.get(
+			attribute, 'port')
 		rule_start, rule_end = Rule.range_bounds(kind, getattr(rule, attribute))
 		subset_rule_start, subset_rule_end = Rule.range_bounds(kind,
 			getattr(subset_rule, attribute))

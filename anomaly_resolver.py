@@ -151,14 +151,13 @@ class Rule(ctypes.Structure):
 		if field == 'port':
 			if wildcard:
 				return '*'
-			bounds = value.split('-')
-			if len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
-				low, high = int(bounds[0]), int(bounds[-1])
-				if low <= high <= 65535:
-					if (low, high) == (0, 65535):
-						return '*'
-					return Rule.portrange2str(range(low, high + 1))
-			raise ValueError(error)
+			try:
+				low, high = Rule.range_bounds('port', value)
+			except ValueError:
+				raise ValueError(error) from None
+			if (low, high) == (0, 65535):
+				return '*'
+			return Rule.portrange2str(range(low, high + 1))
 
 		if field == 'dl_type':
 			dl_types = {name.upper(): name for name in ['ARP', 'IPv4', 'IPv6']}
@@ -424,14 +423,22 @@ class Rule(ctypes.Structure):
 
 	def range_bounds(kind, value):
 		# The first and last value of an 'ip' or 'port' range, as integers.
-		# Ports are parsed directly, without portstr2range's list of values.
+		# Ports are parsed directly, without portstr2range's list of values, and
+		# checked as _sanity_check checks them since #3: a malformed range such
+		# as '80-' raises ValueError, and a reversed one such as '10-5' is not
+		# reordered.
 		if kind == 'ip':
 			addresses = Rule.ipstr2range(value)
 			return int(addresses[0]), int(addresses[-1])
 		if value == '*':
 			return 0, 65535
-		first, _, last = value.partition('-')
-		return int(first), int(last or first)
+		# isascii() because isdecimal() also accepts digits such as '٨٠'.
+		bounds = value.split('-') if isinstance(value, str) and value.isascii() else []
+		if 1 <= len(bounds) <= 2 and all(bound.isdecimal() for bound in bounds):
+			low, high = int(bounds[0]), int(bounds[-1])
+			if low <= high <= 65535:
+				return low, high
+		raise ValueError('Invalid port range %r' % (value,))
 
 	def bounds_range(kind, start, end):
 		# The range string for integer bounds, written as split() writes ranges.

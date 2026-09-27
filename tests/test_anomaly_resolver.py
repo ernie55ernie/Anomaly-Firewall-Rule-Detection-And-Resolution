@@ -1,3 +1,4 @@
+import collections
 import itertools
 import json
 import os
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 
 import networkx as nx
+from netaddr import IPRange, IPSet
 
 from anomaly_resolver import AnomalyResolver, Rule, SimpleRuleParser
 
@@ -48,6 +50,9 @@ class RuleHelperTests(unittest.TestCase):
 			('129.110.97.0-255.255.255.255', '1.2.3.4', False),
 			('0.0.0.0-127.255.255.255', '128.0.0.0-255.255.255.255', True),
 			('10.0.0.0-10.0.0.255', '10.0.1.0-255.255.255.255', True),
+			('255.255.255.254', '255.255.255.255', True),
+			('0.0.0.0-255.255.255.254', '255.255.255.255', True),
+			('0.0.0.0', '255.255.255.255', False),
 		]
 		for first, second, expected in cases:
 			with self.subTest(first=first, second=second):
@@ -56,31 +61,129 @@ class RuleHelperTests(unittest.TestCase):
 		self.assertEqual(Rule.combine_range('10.0.0.0-10.0.0.255', '10.0.1.0-255.255.255.255',
 			attribute='nw_dst'), '10.0.0.0-255.255.255.255')
 
-	def test_contiguous_matches_integer_bounds_in_both_orders(self):
-		# Ranges near both ends of the address and port spaces, compared with
-		# plain integer arithmetic.
+	def test_contiguous_handles_the_ends_of_the_port_space(self):
+		# Issue #8's boundary for ports: '*', single values at 0 and 65535, and
+		# ranges ending at 65535.
+		cases = [
+			('*', '0', False),
+			('*', '65535', False),
+			('*', '0-65535', False),
+			('0', '65535', False),
+			('0', '1', True),
+			('65534', '65535', True),
+			('0-65534', '65535', True),
+			('1-65535', '0', True),
+			('100-65535', '0-99', True),
+			('100-65535', '0-100', False),
+			('100-65535', '0-98', False),
+		]
+		for first, second, expected in cases:
+			with self.subTest(first=first, second=second):
+				self.assertIs(Rule.contiguous(first, second, attribute='tp_dst'), expected)
+				self.assertIs(Rule.contiguous(second, first, attribute='tp_dst'), expected)
+
+	def test_contiguous_rejects_malformed_port_ranges(self):
+		# The values Rule() rejects since #3 raise ValueError here too, instead of
+		# getting an answer. A reversed range such as '10-5' is not read as '5-10'.
+		malformed = ['-80-', '10-5', '80-', '-80', '-', '', '80--90', '1-2-3', '65536',
+			'70000', '1-70000', '65535-65536', '+80', ' 80', '80 ', '0x50', '1_000', '8O',
+			'٨٠']
+		generator = random.Random(8)
+		for _ in range(50):
+			high = generator.randrange(65535)
+			malformed.append('%d-%d' % (generator.randint(high + 1, 65535), high))
+			malformed.append(str(generator.randint(65536, 10 ** 6)))
+		for value in malformed:
+			with self.subTest(value=value):
+				with self.assertRaises(ValueError):
+					Rule(tp_dst=value)
+				with self.assertRaises(ValueError):
+					Rule.range_bounds('port', value)
+				for other in ['*', '0', '65535', '81']:
+					with self.assertRaises(ValueError):
+						Rule.contiguous(value, other, attribute='tp_dst')
+					with self.assertRaises(ValueError):
+						Rule.contiguous(other, value, attribute='tp_dst')
+
+	def test_contiguous_agrees_with_value_sets_in_both_orders(self):
+		# The expected answer never compares bounds: two ranges are contiguous
+		# when the sets of values they stand for are disjoint and their union has
+		# no gap, that is, holds as many values as its span. Ports are expanded
+		# into sets. Addresses go into netaddr IPSets, which store CIDR blocks, so
+		# even the whole space stays small.
 		generator = random.Random(8)
 
 		def address(number):
 			return '.'.join(str(number >> shift & 255) for shift in (24, 16, 8, 0))
 
-		spaces = [('nw_src', 2 ** 32 - 1, lambda first, last: address(first) if first == last
-				else '%s-%s' % (address(first), address(last))),
-			('tp_dst', 65535, lambda first, last: str(first) if first == last
-				else '%d-%d' % (first, last))]
-		for attribute, top, spell in spaces:
+		def adjacent(values_1, values_2):
+			union = values_1 | values_2
+			if isinstance(union, IPSet):
+				blocks = union.iter_cidrs()
+				count, lowest, highest = union.size, int(blocks[0][0]), int(blocks[-1][-1])
+			else:
+				count, lowest, highest = len(union), min(union), max(union)
+			return values_1.isdisjoint(values_2) and count == highest - lowest + 1
+
+		def pick(top):
+			# The whole space, one value at either end, a range ending at the top or
+			# starting at 0, a wide range, or a short one near either end.
+			kind = generator.randrange(6)
+			if kind == 0:
+				return 0, top
+			if kind == 1:
+				return (generator.choice([0, top]),) * 2
+			if kind == 2:
+				return generator.randint(0, top), top
+			if kind == 3:
+				return 0, generator.randint(0, top)
+			if kind == 4:
+				return tuple(sorted(generator.randint(0, top) for _ in range(2)))
+			low = generator.choice([0, top - 7])
+			first = low + generator.randrange(8)
+			return first, generator.randint(first, low + 7)
+
+		def pick_second(top, first, last):
+			# A range touching the first one on either side, overlapping it, apart
+			# from it on either side, or picked on its own.
+			relation = generator.randrange(6)
+			if relation == 0 and last < top:
+				return last + 1, generator.choice([last + 1, top, generator.randint(last + 1, top)])
+			if relation == 1 and first > 0:
+				return generator.choice([0, first - 1, generator.randint(0, first - 1)]), first - 1
+			if relation == 2:
+				shared = generator.randint(first, last)
+				return generator.randint(0, shared), generator.randint(shared, top)
+			if relation == 3 and last + 2 <= top:
+				start = generator.randint(last + 2, top)
+				return start, generator.randint(start, top)
+			if relation == 4 and first >= 2:
+				end = generator.randint(0, first - 2)
+				return generator.randint(0, end), end
+			return pick(top)
+
+		spaces = [
+			('nw_src', 2 ** 32 - 1, address, '0.0.0.0-255.255.255.255',
+				lambda first, last: IPSet(IPRange(first, last))),
+			('tp_dst', 65535, str, '0-65535', lambda first, last: set(range(first, last + 1))),
+		]
+		for attribute, top, spell, full, values in spaces:
+			outcomes = collections.Counter()
 			for _ in range(300):
-				bounds = list()
-				for _ in range(2):
-					low = generator.choice([0, top - 7])
-					first = low + generator.randrange(8)
-					bounds.append((first, generator.randrange(first, low + 8)))
-				(first_1, last_1), (first_2, last_2) = bounds
-				expected = last_1 + 1 == first_2 or last_2 + 1 == first_1
-				range_1, range_2 = spell(first_1, last_1), spell(first_2, last_2)
+				bounds_1 = pick(top)
+				bounds_2 = pick_second(top, *bounds_1)
+				expected = adjacent(values(*bounds_1), values(*bounds_2))
+				outcomes[expected] += 1
+				range_1, range_2 = [generator.choice(['*', full]) if (first, last) == (0, top)
+					else spell(first) if first == last else '%s-%s' % (spell(first), spell(last))
+					for first, last in [bounds_1, bounds_2]]
 				with self.subTest(attribute=attribute, ranges=(range_1, range_2)):
-					self.assertIs(Rule.contiguous(range_1, range_2, attribute=attribute), expected)
-					self.assertIs(Rule.contiguous(range_2, range_1, attribute=attribute), expected)
+					forward = Rule.contiguous(range_1, range_2, attribute=attribute)
+					backward = Rule.contiguous(range_2, range_1, attribute=attribute)
+					self.assertIs(forward, backward)
+					self.assertIs(forward, expected)
+			# Both answers come up often, so the test can't pass on only one.
+			self.assertGreater(min(outcomes[True], outcomes[False]), 50, outcomes)
 
 
 class MergeTests(unittest.TestCase):

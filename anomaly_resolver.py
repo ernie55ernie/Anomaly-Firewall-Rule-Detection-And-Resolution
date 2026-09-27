@@ -295,8 +295,9 @@ class Rule(ctypes.Structure):
 		return str(x[0])
 
 	def ipinrange(first, second):
-		# Every address value is one contiguous range, so bounds decide this
-		# as well as IPSets did, without building them.
+		# Every IPv4 address value is one contiguous range, so bounds decide
+		# this as well as IPSets did, without building them. range_bounds()
+		# rejects IPv6, which IPSets kept apart from IPv4.
 		first_low, first_high = Rule.range_bounds('ip', first)
 		second_low, second_high = Rule.range_bounds('ip', second)
 		return second_low <= first_low and first_high <= second_high
@@ -431,6 +432,11 @@ class Rule(ctypes.Structure):
 		# reordered.
 		if kind == 'ip':
 			addresses = Rule.ipstr2range(value)
+			# nw_src and nw_dst hold IPv4 only. Bounds are bare integers, so an
+			# IPv6 range such as '::5-::a' would compare, and split() would
+			# rebuild it, as the IPv4 range 0.0.0.5-0.0.0.10.
+			if addresses.version != 4:
+				raise ValueError('Invalid IPv4 range %r' % (value,))
 			return addresses.first, addresses.last
 		if value == '*':
 			return 0, 65535

@@ -6,12 +6,13 @@ import random
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
+from unittest import mock
 
 import networkx as nx
 from netaddr import IPRange, IPSet
 
+import anomaly_resolver
 from anomaly_resolver import AnomalyResolver, Rule, SimpleRuleParser
 
 
@@ -245,6 +246,27 @@ class RuleHelperTests(unittest.TestCase):
 			# Each answer comes up often both ways, so no check can pass on one.
 			for key in ['first inside', 'second inside', 'disjoint']:
 				self.assertTrue(30 < outcomes[key] < 270, (kind, outcomes))
+
+	def test_address_checks_reject_ipv6(self):
+		# Rule() accepts only IPv4 in nw_src and nw_dst, but a field assigned
+		# directly still reaches these helpers. Bounds are bare integers, and
+		# '::a00:1' is the number of 10.0.0.1, so comparing IPv6 as IPv4 gave
+		# answers such as '::a00:1' being inside 10.0.0.0/24. They raise instead,
+		# whichever operand is IPv6.
+		ipv6 = ['::a00:1', '::5-::a', '::8-::f', '::ffff:10.0.0.1', '::/0']
+		ipv4 = ['10.0.0.0/24', '10.0.0.1', '0.0.0.5-0.0.0.10', '*']
+		for value in ipv6:
+			with self.subTest(value=value):
+				with self.assertRaises(ValueError):
+					Rule(nw_src=value)
+				with self.assertRaises(ValueError):
+					Rule.range_bounds('ip', value)
+				for other in ipv4 + ipv6:
+					for check in [Rule.ipinrange, Rule.ipdisjoint]:
+						with self.assertRaises(ValueError):
+							check(value, other)
+						with self.assertRaises(ValueError):
+							check(other, value)
 
 
 class MergeTests(unittest.TestCase):
@@ -720,6 +742,20 @@ class ResolveTests(unittest.TestCase):
 		self.assertEqual(sum(rule is twin for rule in rules), 1)
 		self.assertEqual(sum(rule is existing for rule in rules), 1)
 
+	def test_directly_assigned_ipv6_is_not_rewritten_as_ipv4(self):
+		# Splitting '::5-::a' against '::8-::f' through integer bounds gave
+		# 0.0.0.5-0.0.0.7, 0.0.0.11-0.0.0.15 and 0.0.0.8-0.0.0.10: other hosts,
+		# with no error. Resolution raises instead.
+		deny = Rule(actions='DENY')
+		deny.nw_src = '::5-::a'
+		allow = Rule(actions='ALLOW')
+		allow.nw_src = '::8-::f'
+		with self.assertRaises(ValueError):
+			self.resolver.resolve_anomalies([deny, allow])
+		with self.assertRaises(ValueError):
+			self.resolver.split(deny, allow, 'nw_src', [])
+		self.assertEqual((deny.nw_src, allow.nw_src), ('::5-::a', '::8-::f'))
+
 
 class SplitOrderTests(unittest.TestCase):
 
@@ -1003,13 +1039,22 @@ class RedundancyRemovalTests(unittest.TestCase):
 		self.assertIs(kept[0], subnet)
 		self.assertIs(kept[1], everyone)
 
-	def test_rule_with_a_reversed_range_raises(self):
+	def test_reversed_range_raises_when_its_field_is_compared(self):
 		# Rule() rejects a reversed range, but assigning the field directly
-		# still works. Comparing it raises ValueError instead of reading it as an
-		# empty range and dropping the rule. A reversed address range already
-		# raised, as netaddr's AddrFormatError.
+		# still works. The range checks always raise ValueError for one, instead
+		# of reading it as an empty range. A rule comparison raises only if it
+		# gets to that field: issubset() and disjoint() stop at the first field
+		# that decides, so against a rule on another subnet the reversed range is
+		# never read, and the rule is kept as it is. A reversed address range
+		# behaves the same way, raising netaddr's AddrFormatError.
+		for check in [Rule.portinrange, Rule.portdisjoint]:
+			with self.assertRaises(ValueError):
+				check('80-20', '1-100')
+			with self.assertRaises(ValueError):
+				check('1-100', '80-20')
 		reversed_range = Rule(nw_src='10.0.0.1', tp_dst='20-80', actions='DENY')
 		reversed_range.tp_dst = '80-20'
+		# The later rule's nw_src contains the first rule's, so tp_dst is compared.
 		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='1-100', actions='DENY')
 		with self.assertRaises(ValueError):
 			self.resolver.remove_redundant_rules([reversed_range, subnet])
@@ -1115,11 +1160,12 @@ class RedundancyRemovalTests(unittest.TestCase):
 
 
 class SpeedTests(unittest.TestCase):
-	# Issue #10: every port check built a set of up to 65,536 values, and
-	# every tree step a dict of all edges. On these rules, detection took about
-	# 16 s, resolution about 8 s and building the tree about 15 s. Each now
-	# takes under 0.1 s; the 2 s limit leaves room for slow machines while
-	# still catching a return to the old cost.
+	# Issue #10: every port check built a set of up to 65,536 values, address
+	# checks built IPSets, split() listed every port of the range it split, and
+	# each tree step copied the attributes of the whole tree. On these rules,
+	# detection, resolution and building the tree each took about 15 s, and
+	# each now takes under 0.1 s. Rather than time the runs, which
+	# depends on the machine, these tests make those slow calls fail.
 
 	def setUp(self):
 		self.resolver = AnomalyResolver(log_level='CRITICAL')
@@ -1134,21 +1180,39 @@ class SpeedTests(unittest.TestCase):
 			tp_dst=generator.choice(['*', '22', '80', '443', '1000-2000']),
 			actions=generator.choice(['ALLOW', 'DENY'])) for _ in range(count)]
 
-	def assertFast(self, action, *arguments):
-		start = time.perf_counter()
-		action(*arguments)
-		self.assertLess(time.perf_counter() - start, 2)
+	def forbid(self, target, name):
+		# Until the test ends, calling target.name fails the test.
+		patcher = mock.patch.object(target, name,
+			side_effect=AssertionError('%s must not be called' % name))
+		patcher.start()
+		self.addCleanup(patcher.stop)
 
-	def test_detection_is_fast(self):
+	def forbid_value_sets(self):
+		self.forbid(Rule, 'portstr2range')
+		self.forbid(anomaly_resolver, 'IPSet')
+
+	def test_detection_compares_bounds(self):
 		rules = self.rules(100, lambda generator: '10.0.%d.0/24' % generator.randrange(4))
-		self.assertFast(self.resolver.detect_anomalies, rules)
+		self.forbid_value_sets()
+		self.resolver.detect_anomalies(rules)
 
-	def test_resolution_is_fast(self):
-		rules = self.rules(40, lambda generator: '10.0.%d.0/24' % generator.randrange(4))
-		self.assertFast(self.resolver.resolve_anomalies, rules)
+	def test_resolution_compares_bounds(self):
+		# Some sources are '*', so that rules overlap without one containing the
+		# other, and split() runs, including on '*' ports.
+		rules = self.rules(40, lambda generator: generator.choice(['*',
+			'10.0.%d.0/24' % generator.randrange(4)]))
+		self.forbid_value_sets()
+		with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+			self.resolver.resolve_anomalies(rules)
+		# The rules overlap, so split() ran as well.
+		self.assertTrue(any(record.getMessage().startswith('Overlapping rule')
+			for record in logs.records))
 
-	def test_building_the_rule_tree_is_fast(self):
+	def test_building_the_rule_tree_reads_single_edges(self):
 		# Single hosts, so that the tree has many edges.
 		rules = self.rules(400, lambda generator: '10.0.%d.%d' % (generator.randrange(4),
 			generator.randrange(256)))
-		self.assertFast(self.resolver.construct_rule_tree, rules, False)
+		self.forbid(nx, 'get_node_attributes')
+		self.forbid(nx, 'get_edge_attributes')
+		self.resolver.construct_rule_tree(rules, plot=False)
+		self.assertGreater(self.resolver.tree.number_of_edges(), 400)

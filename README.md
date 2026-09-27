@@ -137,11 +137,7 @@ At each node, the paper merges two sibling edges when their ranges are exactly c
 An audit of commit `67b819b` found the problems below. Each one was reproduced by running the code. The critical and high ones are tracked as GitHub issues, each with repro steps and a suggested fix.
 
 ### Critical and high
-| Severity | Problem | Where | Issue |
-|---|---|---|---|
-| High | Detection and resolution are slow: each wildcard port check builds a 65,536-element set | `Rule.portstr2range` | [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) |
-
-Fixed since the audit:
+None are open. Fixed since the audit:
 - [#2](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/2) (Critical): redundancy removal no longer deletes a rule when an overlapping rule with a different action comes before the rule that contains it.
 - [#3](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/3) (Critical): values that don't parse are rejected with an error naming the line, instead of being read as `ANY`, TCP, `IN` or `DENY`.
 - [#9](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/9) (High): `ICMPv6` and `dl_type` `IPv6` are kept instead of being read as TCP and IPv4.
@@ -150,6 +146,7 @@ Fixed since the audit:
 - [#6](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/6) (High): rules are split on their attributes in a fixed order, so resolving gives the same rules on every run instead of depending on `PYTHONHASHSEED`.
 - [#7](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/7) (High): merging groups sibling edges whose subtrees hold the same rules and joins their ranges wherever they overlap or touch, so it no longer raises `KeyError` at nodes with three or more children. The merged rules depend only on the rules themselves, not on the order they were inserted in.
 - [#8](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/8) (High): `Rule.contiguous` compares integer bounds, so it no longer raises `IndexError` on ANY or on ranges that end at 255.255.255.255, and it gives the same answer in either argument order. Merging stopped calling it in #7's fix, so `--merge` already no longer crashed.
+- [#10](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/10) (High): port and address checks compare the first and last value of each range instead of building sets of values, where `*` meant 65,536 ports. Building the rule tree reads each edge directly instead of copying every edge at each step. On rules like those in the issue, detecting anomalies in 100 rules takes about 0.06 s instead of 16 s, and building the tree for 400 rules about 0.02 s instead of 15 s.
 
 ### Medium
 - `detect_anomalies` ignores rule order. A specific rule placed before a general one is reported as shadowing, although the paper calls that generalization, not an anomaly. The function also returns nothing.

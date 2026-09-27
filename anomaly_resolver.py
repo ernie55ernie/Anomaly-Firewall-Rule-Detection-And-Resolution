@@ -424,6 +424,23 @@ class Rule(ctypes.Structure):
 			)
 		return None
 
+	def range_bounds(kind, value):
+		# The first and last value of an 'ip' or 'port' range, as integers.
+		# Ports are parsed directly, without portstr2range's list of values.
+		if kind == 'ip':
+			addresses = Rule.ipstr2range(value)
+			return int(addresses[0]), int(addresses[-1])
+		if value == '*':
+			return 0, 65535
+		first, _, last = value.partition('-')
+		return int(first), int(last or first)
+
+	def bounds_range(kind, start, end):
+		# The range string for integer bounds, written as split() writes ranges.
+		if kind == 'ip':
+			return Rule.iprange2str(IPRange(start, end))
+		return Rule.portrange2str(range(start, end + 1))
+
 class AnomalyResolver:
 
 	# TODO support for
@@ -757,40 +774,59 @@ class AnomalyResolver:
 
 	def merge(self, n):
 		'''
-		Merges edges of node n representing a continuous range
+		Merges the edges of node n whose subtrees hold the same rules
 		for all edge e in n.edges:
 			merge(e.node)
-		for all edge e in n.edges:
-			for all edge e' != e in n.edges:
-				if e and e' range are contiguous and Subtree(e)=Subtree(e'):
-					Merge e.range and e'.range into e.range
-					Remove e' from n.edges
+		group n.edges by the rules in their subtrees
+		for each group:
+			join the ranges that overlap or are contiguous into intervals
+			keep one edge per interval, with the interval as its range
 		'''
+		# The paper merges exactly contiguous ranges. Joining overlapping ranges
+		# too is still safe, because edges in a group lead to the same rules,
+		# and it makes the result depend only on the rules: not on the order
+		# they were inserted in, nor on duplicate or overlapping spellings.
 		tree = self.tree
 		edges = tree.edges()
 		attribute = tree.nodes[n]['attr']
 		for e in tree.edges([n]):
 			self.merge(e[1])
-		# A merge removes an edge and widens another, so the pairs are listed
-		# again after each one: a stale pair would name a removed edge, and the
-		# widened edge may now be contiguous with a sibling it wasn't before.
-		merged = True
-		while merged:
-			merged = False
-			for edge_1, edge_2 in itertools.combinations(list(tree.edges([n])), 2):
-				range_1 = edges[edge_1]['range']
-				range_2 = edges[edge_2]['range']
-				if Rule.contiguous(range_1, range_2, attribute=attribute) \
-					and self.subtree_equal(edge_1, edge_2):
-					result = Rule.combine_range(range_1, range_2, attribute=attribute)
-					nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
+		if attribute in ('nw_src', 'nw_dst'):
+			kind = 'ip'
+		elif attribute in ('in_port', 'tp_src', 'tp_dst'):
+			kind = 'port'
+		else:
+			return
+		groups = dict()
+		for edge in tree.edges([n]):
+			groups.setdefault(self.subtree_signature(edge[1]), []).append(edge)
+		for group in groups.values():
+			if len(group) < 2:
+				continue
+			# Sort by bounds, then spelling, then subtree, never by node names,
+			# which depend on insertion order.
+			members = sorted((Rule.range_bounds(kind, edges[edge]['range']),
+				edges[edge]['range'], self.subtree_paths(edge[1]), edge) for edge in group)
+			# Each interval: the members it joins and its end so far.
+			intervals = list()
+			for member in members:
+				(start, end) = member[0]
+				if intervals and start <= intervals[-1][1] + 1:
+					intervals[-1][0].append(member)
+					intervals[-1][1] = max(intervals[-1][1], end)
+				else:
+					intervals.append([[member], end])
+			for joined, end in intervals:
+				if len(joined) < 2:
+					continue
+				start = joined[0][0][0]
+				nx.set_edge_attributes(tree, {joined[0][3]: Rule.bounds_range(kind, start, end)}, 'range')
+				for member in joined[1:]:
 					self.removing_edges = []
 					self.removing_nodes = []
-					self.cut_edge(edge_2)
+					self.cut_edge(member[3])
 					tree.remove_edges_from(self.removing_edges)
 					tree.remove_nodes_from(self.removing_nodes)
-					merged = True
-					break
 
 	def cut_edge(self, edge):
 		'''
@@ -821,6 +857,17 @@ class AnomalyResolver:
 			return frozenset([()])
 		return frozenset((tree.edges[edge]['range'],) + path
 			for edge in edges for path in self.subtree_signature(edge[1]))
+
+	def subtree_paths(self, node):
+		'''
+		Every rule below node, as a sorted tuple of range tuples, repeats kept
+		'''
+		tree = self.tree
+		edges = list(tree.edges([node]))
+		if not edges:
+			return ((),)
+		return tuple(sorted((tree.edges[edge]['range'],) + path
+			for edge in edges for path in self.subtree_paths(edge[1])))
 
 if __name__ == '__main__':
 

@@ -38,6 +38,50 @@ class RuleHelperTests(unittest.TestCase):
 			'129.110.96.64-129.110.96.164'
 		)
 
+	def test_contiguous_handles_ranges_ending_at_the_last_address(self):
+		# Issue #8: adding 1 to the IPAddress 255.255.255.255 raised IndexError,
+		# so ANY and ranges ending there failed in one argument order or both.
+		cases = [
+			('*', '1.2.3.4', False),
+			('*', '*', False),
+			('255.255.255.255', '10.0.0.1', False),
+			('129.110.97.0-255.255.255.255', '1.2.3.4', False),
+			('0.0.0.0-127.255.255.255', '128.0.0.0-255.255.255.255', True),
+			('10.0.0.0-10.0.0.255', '10.0.1.0-255.255.255.255', True),
+		]
+		for first, second, expected in cases:
+			with self.subTest(first=first, second=second):
+				self.assertIs(Rule.contiguous(first, second, attribute='nw_src'), expected)
+				self.assertIs(Rule.contiguous(second, first, attribute='nw_src'), expected)
+		self.assertEqual(Rule.combine_range('10.0.0.0-10.0.0.255', '10.0.1.0-255.255.255.255',
+			attribute='nw_dst'), '10.0.0.0-255.255.255.255')
+
+	def test_contiguous_matches_integer_bounds_in_both_orders(self):
+		# Ranges near both ends of the address and port spaces, compared with
+		# plain integer arithmetic.
+		generator = random.Random(8)
+
+		def address(number):
+			return '.'.join(str(number >> shift & 255) for shift in (24, 16, 8, 0))
+
+		spaces = [('nw_src', 2 ** 32 - 1, lambda first, last: address(first) if first == last
+				else '%s-%s' % (address(first), address(last))),
+			('tp_dst', 65535, lambda first, last: str(first) if first == last
+				else '%d-%d' % (first, last))]
+		for attribute, top, spell in spaces:
+			for _ in range(300):
+				bounds = list()
+				for _ in range(2):
+					low = generator.choice([0, top - 7])
+					first = low + generator.randrange(8)
+					bounds.append((first, generator.randrange(first, low + 8)))
+				(first_1, last_1), (first_2, last_2) = bounds
+				expected = last_1 + 1 == first_2 or last_2 + 1 == first_1
+				range_1, range_2 = spell(first_1, last_1), spell(first_2, last_2)
+				with self.subTest(attribute=attribute, ranges=(range_1, range_2)):
+					self.assertIs(Rule.contiguous(range_1, range_2, attribute=attribute), expected)
+					self.assertIs(Rule.contiguous(range_2, range_1, attribute=attribute), expected)
+
 
 class MergeTests(unittest.TestCase):
 	# Trees are built with plot=False so the README images in img/ are not

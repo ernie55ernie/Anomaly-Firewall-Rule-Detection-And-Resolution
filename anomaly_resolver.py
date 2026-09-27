@@ -398,15 +398,13 @@ class Rule(ctypes.Structure):
 
 	def contiguous(r_1, r_2, attribute=None):
 		range_type = Rule._range_type(attribute, r_1, r_2)
-		if range_type == 'ip':
-			range_1 = Rule.ipstr2range(r_1)
-			range_2 = Rule.ipstr2range(r_2)
-		elif range_type == 'port':
-			range_1 = Rule.portstr2range(r_1)
-			range_2 = Rule.portstr2range(r_2)
-		else:
+		if range_type is None:
 			return False
-		return range_1[-1] + 1 == range_2[0] or range_1[0] == range_2[-1] + 1
+		# Compare integers: adding 1 to the IPAddress 255.255.255.255 raises
+		# IndexError, which made ANY and ranges ending there crash.
+		start_1, end_1 = Rule.range_bounds(range_type, r_1)
+		start_2, end_2 = Rule.range_bounds(range_type, r_2)
+		return end_1 + 1 == start_2 or end_2 + 1 == start_1
 
 	def combine_range(r_1, r_2, attribute=None):
 		range_type = Rule._range_type(attribute, r_1, r_2)

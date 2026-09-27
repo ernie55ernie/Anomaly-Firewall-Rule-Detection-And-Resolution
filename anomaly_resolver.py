@@ -270,9 +270,11 @@ class Rule(ctypes.Structure):
 		return False
 
 	def portinrange(first, second):
-		first_set = set(Rule.portstr2range(first))
-		second_set = set(Rule.portstr2range(second))
-		return first_set.issubset(second_set)
+		# Compare bounds: building sets of values took milliseconds for '*',
+		# which has 65,536 of them, and every pair of rules needs several checks.
+		first_low, first_high = Rule.range_bounds('port', first)
+		second_low, second_high = Rule.range_bounds('port', second)
+		return second_low <= first_low and first_high <= second_high
 
 	def portstr2range(x):
 		res = list()
@@ -293,21 +295,22 @@ class Rule(ctypes.Structure):
 		return str(x[0])
 
 	def ipinrange(first, second):
-		first_set = Rule.ipstr2range(first, format='set')
-		second_set = Rule.ipstr2range(second, format='set')
-		return first_set.issubset(second_set)
+		# Every IPv4 address value is one contiguous range, so bounds decide
+		# this as well as IPSets did, without building them. range_bounds()
+		# rejects IPv6, which IPSets kept apart from IPv4.
+		first_low, first_high = Rule.range_bounds('ip', first)
+		second_low, second_high = Rule.range_bounds('ip', second)
+		return second_low <= first_low and first_high <= second_high
 
 	def portdisjoint(first, second):
-		if first == '0-65535' or second == '0-65535':
-			return False
-		first_set = set(Rule.portstr2range(first))
-		second_set = set(Rule.portstr2range(second))
-		return not first_set.intersection(second_set)
+		first_low, first_high = Rule.range_bounds('port', first)
+		second_low, second_high = Rule.range_bounds('port', second)
+		return first_high < second_low or second_high < first_low
 
 	def ipdisjoint(first, second):
-		first_set = Rule.ipstr2range(first, format='set')
-		second_set = Rule.ipstr2range(second, format='set')
-		return not first_set.intersection(second_set)
+		first_low, first_high = Rule.range_bounds('ip', first)
+		second_low, second_high = Rule.range_bounds('ip', second)
+		return first_high < second_low or second_high < first_low
 
 	def find_attribute_set(self, subset_rule):
 		'''
@@ -429,7 +432,12 @@ class Rule(ctypes.Structure):
 		# reordered.
 		if kind == 'ip':
 			addresses = Rule.ipstr2range(value)
-			return int(addresses[0]), int(addresses[-1])
+			# nw_src and nw_dst hold IPv4 only. Bounds are bare integers, so an
+			# IPv6 range such as '::5-::a' would compare, and split() would
+			# rebuild it, as the IPv4 range 0.0.0.5-0.0.0.10.
+			if addresses.version != 4:
+				raise ValueError('Invalid IPv4 range %r' % (value,))
+			return addresses.first, addresses.last
 		if value == '*':
 			return 0, 65535
 		# isascii() because isdecimal() also accepts digits such as '٨٠'.
@@ -590,9 +598,7 @@ class AnomalyResolver:
 		# some of rule's packets. The check is conservative: a rule covered only
 		# by several later rules together is kept. Only containment matters for
 		# a later rule with the same action, and any overlap for one with a
-		# different action, so each later rule needs a single check. A rule with
-		# an empty range, which matches nothing, is removed once a later rule
-		# shares its action.
+		# different action, so each later rule needs a single check.
 		for later_rule in later_rules:
 			if rule.actions == later_rule.actions:
 				if rule.issubset(later_rule):
@@ -663,12 +669,11 @@ class AnomalyResolver:
 		Split overlapping rules r and s based on attribute a
 		'''
 		self.resolver_logger.info('Overlapping rule %s, %s' % (str(rule), str(subset_rule)))
-		rule_range = rule.get_attribute_range(attribute)
-		rule_start = rule_range[0]
-		rule_end = rule_range[-1]
-		subset_rule_range = subset_rule.get_attribute_range(attribute)
-		subset_rule_start = subset_rule_range[0]
-		subset_rule_end = subset_rule_range[-1]
+		# Integer bounds, rather than get_attribute_range's list of every port.
+		kind = 'ip' if attribute in ('nw_src', 'nw_dst') else 'port'
+		rule_start, rule_end = Rule.range_bounds(kind, getattr(rule, attribute))
+		subset_rule_start, subset_rule_end = Rule.range_bounds(kind,
+			getattr(subset_rule, attribute))
 
 		left = min(rule_start, subset_rule_start)
 		right = max(rule_end, subset_rule_end)
@@ -758,9 +763,11 @@ class AnomalyResolver:
 		tree = self.tree
 		attr_list = self.attr_list
 		attr_dict = self.attr_dict
-		attr = nx.get_node_attributes(tree, 'attr')[node]
+		# Look up this node and edge only: nx.get_node_attributes and
+		# get_edge_attributes build a dict of the whole tree on every call.
+		attr = tree.nodes[node]['attr']
 		for snode in tree.successors(node):
-			edge_range = nx.get_edge_attributes(tree, 'range')[(node, snode)]
+			edge_range = tree.edges[node, snode]['range']
 			if rule.get_attribute_range(attr, format = 'string') == edge_range:
 				self.tree_insert(snode, rule)
 				return

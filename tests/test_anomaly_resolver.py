@@ -7,10 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import networkx as nx
 from netaddr import IPRange, IPSet
 
+import anomaly_resolver
 from anomaly_resolver import AnomalyResolver, Rule, SimpleRuleParser
 
 
@@ -19,6 +21,59 @@ def first_match(rules, packet):
 		if packet.issubset(rule):
 			return rule.actions
 	return None
+
+
+def address(number):
+	return '.'.join(str(number >> shift & 255) for shift in (24, 16, 8, 0))
+
+
+def random_bounds(generator, top):
+	# The whole space, one value at either end, a range ending at the top or
+	# starting at 0, a wide range, or a short one near either end.
+	kind = generator.randrange(6)
+	if kind == 0:
+		return 0, top
+	if kind == 1:
+		return (generator.choice([0, top]),) * 2
+	if kind == 2:
+		return generator.randint(0, top), top
+	if kind == 3:
+		return 0, generator.randint(0, top)
+	if kind == 4:
+		return tuple(sorted(generator.randint(0, top) for _ in range(2)))
+	low = generator.choice([0, top - 7])
+	first = low + generator.randrange(8)
+	return first, generator.randint(first, low + 7)
+
+
+def related_bounds(generator, top, first, last):
+	# A range touching the given one on either side, overlapping it, apart
+	# from it on either side, or picked on its own.
+	relation = generator.randrange(6)
+	if relation == 0 and last < top:
+		return last + 1, generator.choice([last + 1, top, generator.randint(last + 1, top)])
+	if relation == 1 and first > 0:
+		return generator.choice([0, first - 1, generator.randint(0, first - 1)]), first - 1
+	if relation == 2:
+		shared = generator.randint(first, last)
+		return generator.randint(0, shared), generator.randint(shared, top)
+	if relation == 3 and last + 2 <= top:
+		start = generator.randint(last + 2, top)
+		return start, generator.randint(start, top)
+	if relation == 4 and first >= 2:
+		end = generator.randint(0, first - 2)
+		return generator.randint(0, end), end
+	return random_bounds(generator, top)
+
+
+def range_text(generator, bounds, top, spell, full):
+	# '*' or the spelled-out full range for the whole space, one value, or a-b.
+	first, last = bounds
+	if bounds == (0, top):
+		return generator.choice(['*', full])
+	if first == last:
+		return spell(first)
+	return '%s-%s' % (spell(first), spell(last))
 
 
 class RuleHelperTests(unittest.TestCase):
@@ -113,9 +168,6 @@ class RuleHelperTests(unittest.TestCase):
 		# even the whole space stays small.
 		generator = random.Random(8)
 
-		def address(number):
-			return '.'.join(str(number >> shift & 255) for shift in (24, 16, 8, 0))
-
 		def adjacent(values_1, values_2):
 			union = values_1 | values_2
 			if isinstance(union, IPSet):
@@ -125,43 +177,6 @@ class RuleHelperTests(unittest.TestCase):
 				count, lowest, highest = len(union), min(union), max(union)
 			return values_1.isdisjoint(values_2) and count == highest - lowest + 1
 
-		def pick(top):
-			# The whole space, one value at either end, a range ending at the top or
-			# starting at 0, a wide range, or a short one near either end.
-			kind = generator.randrange(6)
-			if kind == 0:
-				return 0, top
-			if kind == 1:
-				return (generator.choice([0, top]),) * 2
-			if kind == 2:
-				return generator.randint(0, top), top
-			if kind == 3:
-				return 0, generator.randint(0, top)
-			if kind == 4:
-				return tuple(sorted(generator.randint(0, top) for _ in range(2)))
-			low = generator.choice([0, top - 7])
-			first = low + generator.randrange(8)
-			return first, generator.randint(first, low + 7)
-
-		def pick_second(top, first, last):
-			# A range touching the first one on either side, overlapping it, apart
-			# from it on either side, or picked on its own.
-			relation = generator.randrange(6)
-			if relation == 0 and last < top:
-				return last + 1, generator.choice([last + 1, top, generator.randint(last + 1, top)])
-			if relation == 1 and first > 0:
-				return generator.choice([0, first - 1, generator.randint(0, first - 1)]), first - 1
-			if relation == 2:
-				shared = generator.randint(first, last)
-				return generator.randint(0, shared), generator.randint(shared, top)
-			if relation == 3 and last + 2 <= top:
-				start = generator.randint(last + 2, top)
-				return start, generator.randint(start, top)
-			if relation == 4 and first >= 2:
-				end = generator.randint(0, first - 2)
-				return generator.randint(0, end), end
-			return pick(top)
-
 		spaces = [
 			('nw_src', 2 ** 32 - 1, address, '0.0.0.0-255.255.255.255',
 				lambda first, last: IPSet(IPRange(first, last))),
@@ -170,13 +185,12 @@ class RuleHelperTests(unittest.TestCase):
 		for attribute, top, spell, full, values in spaces:
 			outcomes = collections.Counter()
 			for _ in range(300):
-				bounds_1 = pick(top)
-				bounds_2 = pick_second(top, *bounds_1)
+				bounds_1 = random_bounds(generator, top)
+				bounds_2 = related_bounds(generator, top, *bounds_1)
 				expected = adjacent(values(*bounds_1), values(*bounds_2))
 				outcomes[expected] += 1
-				range_1, range_2 = [generator.choice(['*', full]) if (first, last) == (0, top)
-					else spell(first) if first == last else '%s-%s' % (spell(first), spell(last))
-					for first, last in [bounds_1, bounds_2]]
+				range_1, range_2 = [range_text(generator, bounds, top, spell, full)
+					for bounds in [bounds_1, bounds_2]]
 				with self.subTest(attribute=attribute, ranges=(range_1, range_2)):
 					forward = Rule.contiguous(range_1, range_2, attribute=attribute)
 					backward = Rule.contiguous(range_2, range_1, attribute=attribute)
@@ -184,6 +198,75 @@ class RuleHelperTests(unittest.TestCase):
 					self.assertIs(forward, expected)
 			# Both answers come up often, so the test can't pass on only one.
 			self.assertGreater(min(outcomes[True], outcomes[False]), 50, outcomes)
+
+	def test_range_checks_agree_with_value_sets(self):
+		# Issue #10: containment and disjointness compare bounds now, instead of
+		# building a set of up to 65,536 ports for every check. The expected
+		# answers still come from sets of values: Python sets of ports, and
+		# netaddr IPSets of addresses. Some addresses are CIDR blocks, the form
+		# Rule() stores networks in, so that blocks nest.
+		generator = random.Random(10)
+
+		def cidr_around(value):
+			# The block holding value, with a random prefix length.
+			prefix = generator.randint(0, 32)
+			network = (value >> (32 - prefix)) << (32 - prefix)
+			bounds = network, network + 2 ** (32 - prefix) - 1
+			return bounds, '%s/%d' % (address(network), prefix)
+
+		spaces = [
+			('ip', Rule.ipinrange, Rule.ipdisjoint, 2 ** 32 - 1, address,
+				'0.0.0.0-255.255.255.255', lambda first, last: IPSet(IPRange(first, last))),
+			('port', Rule.portinrange, Rule.portdisjoint, 65535, str, '0-65535',
+				lambda first, last: set(range(first, last + 1))),
+		]
+		for kind, inrange, disjoint, top, spell, full, values in spaces:
+			outcomes = collections.Counter()
+			for _ in range(300):
+				if kind == 'ip' and generator.randrange(4) == 0:
+					bounds_1, range_1 = cidr_around(generator.randint(0, top))
+				else:
+					bounds_1 = random_bounds(generator, top)
+					range_1 = range_text(generator, bounds_1, top, spell, full)
+				if kind == 'ip' and generator.randrange(3) == 0:
+					bounds_2, range_2 = cidr_around(generator.randint(*bounds_1))
+				else:
+					bounds_2 = related_bounds(generator, top, *bounds_1)
+					range_2 = range_text(generator, bounds_2, top, spell, full)
+				values_1, values_2 = values(*bounds_1), values(*bounds_2)
+				expected = {'first inside': values_1.issubset(values_2),
+					'second inside': values_2.issubset(values_1),
+					'disjoint': values_1.isdisjoint(values_2)}
+				outcomes.update(key for key, value in expected.items() if value)
+				with self.subTest(kind=kind, ranges=(range_1, range_2)):
+					self.assertIs(inrange(range_1, range_2), expected['first inside'])
+					self.assertIs(inrange(range_2, range_1), expected['second inside'])
+					self.assertIs(disjoint(range_1, range_2), expected['disjoint'])
+					self.assertIs(disjoint(range_2, range_1), expected['disjoint'])
+			# Each answer comes up often both ways, so no check can pass on one.
+			for key in ['first inside', 'second inside', 'disjoint']:
+				self.assertTrue(30 < outcomes[key] < 270, (kind, outcomes))
+
+	def test_address_checks_reject_ipv6(self):
+		# Rule() accepts only IPv4 in nw_src and nw_dst, but a field assigned
+		# directly still reaches these helpers. Bounds are bare integers, and
+		# '::a00:1' is the number of 10.0.0.1, so comparing IPv6 as IPv4 gave
+		# answers such as '::a00:1' being inside 10.0.0.0/24. They raise instead,
+		# whichever operand is IPv6.
+		ipv6 = ['::a00:1', '::5-::a', '::8-::f', '::ffff:10.0.0.1', '::/0']
+		ipv4 = ['10.0.0.0/24', '10.0.0.1', '0.0.0.5-0.0.0.10', '*']
+		for value in ipv6:
+			with self.subTest(value=value):
+				with self.assertRaises(ValueError):
+					Rule(nw_src=value)
+				with self.assertRaises(ValueError):
+					Rule.range_bounds('ip', value)
+				for other in ipv4 + ipv6:
+					for check in [Rule.ipinrange, Rule.ipdisjoint]:
+						with self.assertRaises(ValueError):
+							check(value, other)
+						with self.assertRaises(ValueError):
+							check(other, value)
 
 
 class MergeTests(unittest.TestCase):
@@ -659,6 +742,20 @@ class ResolveTests(unittest.TestCase):
 		self.assertEqual(sum(rule is twin for rule in rules), 1)
 		self.assertEqual(sum(rule is existing for rule in rules), 1)
 
+	def test_directly_assigned_ipv6_is_not_rewritten_as_ipv4(self):
+		# Splitting '::5-::a' against '::8-::f' through integer bounds gave
+		# 0.0.0.5-0.0.0.7, 0.0.0.11-0.0.0.15 and 0.0.0.8-0.0.0.10: other hosts,
+		# with no error. Resolution raises instead.
+		deny = Rule(actions='DENY')
+		deny.nw_src = '::5-::a'
+		allow = Rule(actions='ALLOW')
+		allow.nw_src = '::8-::f'
+		with self.assertRaises(ValueError):
+			self.resolver.resolve_anomalies([deny, allow])
+		with self.assertRaises(ValueError):
+			self.resolver.split(deny, allow, 'nw_src', [])
+		self.assertEqual((deny.nw_src, allow.nw_src), ('::5-::a', '::8-::f'))
+
 
 class SplitOrderTests(unittest.TestCase):
 
@@ -942,15 +1039,25 @@ class RedundancyRemovalTests(unittest.TestCase):
 		self.assertIs(kept[0], subnet)
 		self.assertIs(kept[1], everyone)
 
-	def test_rule_with_an_empty_range_is_removed(self):
-		# A reversed port range matches nothing, so removing the rule is safe.
-		# Rule() rejects one, but assigning the field directly still works.
-		empty = Rule(nw_src='10.0.0.1', tp_dst='20-80', actions='DENY')
-		empty.tp_dst = '80-20'
+	def test_reversed_range_raises_when_its_field_is_compared(self):
+		# Rule() rejects a reversed range, but assigning the field directly
+		# still works. The range checks always raise ValueError for one, instead
+		# of reading it as an empty range. A rule comparison raises only if it
+		# gets to that field: issubset() and disjoint() stop at the first field
+		# that decides, so against a rule on another subnet the reversed range is
+		# never read, and the rule is kept as it is. A reversed address range
+		# behaves the same way, raising netaddr's AddrFormatError.
+		for check in [Rule.portinrange, Rule.portdisjoint]:
+			with self.assertRaises(ValueError):
+				check('80-20', '1-100')
+			with self.assertRaises(ValueError):
+				check('1-100', '80-20')
+		reversed_range = Rule(nw_src='10.0.0.1', tp_dst='20-80', actions='DENY')
+		reversed_range.tp_dst = '80-20'
+		# The later rule's nw_src contains the first rule's, so tp_dst is compared.
 		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='1-100', actions='DENY')
-		kept = self.resolver.remove_redundant_rules([empty, subnet])
-		self.assertEqual(len(kept), 1)
-		self.assertIs(kept[0], subnet)
+		with self.assertRaises(ValueError):
+			self.resolver.remove_redundant_rules([reversed_range, subnet])
 
 	def test_disjoint_and_same_action_rules_before_the_container_are_skipped(self):
 		host = Rule(nw_src='10.0.0.1', tp_dst='80-81', actions='DENY')
@@ -1050,3 +1157,62 @@ class RedundancyRemovalTests(unittest.TestCase):
 			for packet in packets:
 				self.assertEqual(decision(after, packet), decision(before, packet),
 					'%s changed for %s -> %s' % (packet, rules, kept))
+
+
+class SpeedTests(unittest.TestCase):
+	# Issue #10: every port check built a set of up to 65,536 values, address
+	# checks built IPSets, split() listed every port of the range it split, and
+	# each tree step copied the attributes of the whole tree. On these rules,
+	# detection, resolution and building the tree each took about 15 s, and
+	# each now takes under 0.1 s. Rather than time the runs, which
+	# depends on the machine, these tests make those slow calls fail.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def rules(self, count, source):
+		# The rules from the issue's reproducer, with sources from source().
+		generator = random.Random(10)
+		return [Rule(nw_src=source(generator), nw_dst='10.1.0.%d' % generator.randrange(8),
+			tp_dst=generator.choice(['*', '22', '80', '443', '1000-2000']),
+			actions=generator.choice(['ALLOW', 'DENY'])) for _ in range(count)]
+
+	def forbid(self, target, name):
+		# Until the test ends, calling target.name fails the test.
+		patcher = mock.patch.object(target, name,
+			side_effect=AssertionError('%s must not be called' % name))
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def forbid_value_sets(self):
+		self.forbid(Rule, 'portstr2range')
+		self.forbid(anomaly_resolver, 'IPSet')
+
+	def test_detection_compares_bounds(self):
+		rules = self.rules(100, lambda generator: '10.0.%d.0/24' % generator.randrange(4))
+		self.forbid_value_sets()
+		self.resolver.detect_anomalies(rules)
+
+	def test_resolution_compares_bounds(self):
+		# Some sources are '*', so that rules overlap without one containing the
+		# other, and split() runs, including on '*' ports.
+		rules = self.rules(40, lambda generator: generator.choice(['*',
+			'10.0.%d.0/24' % generator.randrange(4)]))
+		self.forbid_value_sets()
+		with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+			self.resolver.resolve_anomalies(rules)
+		# The rules overlap, so split() ran as well.
+		self.assertTrue(any(record.getMessage().startswith('Overlapping rule')
+			for record in logs.records))
+
+	def test_building_the_rule_tree_reads_single_edges(self):
+		# Single hosts, so that the tree has many edges.
+		rules = self.rules(400, lambda generator: '10.0.%d.%d' % (generator.randrange(4),
+			generator.randrange(256)))
+		self.forbid(nx, 'get_node_attributes')
+		self.forbid(nx, 'get_edge_attributes')
+		self.resolver.construct_rule_tree(rules, plot=False)
+		self.assertGreater(self.resolver.tree.number_of_edges(), 400)

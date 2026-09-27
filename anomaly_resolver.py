@@ -771,23 +771,26 @@ class AnomalyResolver:
 		attribute = tree.nodes[n]['attr']
 		for e in tree.edges([n]):
 			self.merge(e[1])
-		combination_list = list(itertools.combinations(tree.edges([n]), 2))
-		self.removing_edges = []
-		self.removing_nodes = []
-		for edge_tuple in combination_list:
-			edge_1 = edge_tuple[0]
-			edge_2 = edge_tuple[1]
-			range_1 = edges[edge_1]['range']
-			range_2 = edges[edge_2]['range']
-			if Rule.contiguous(range_1, range_2, attribute=attribute) \
-				and self.subtree_equal(edge_1, edge_2):
-				result = Rule.combine_range(range_1, range_2, attribute=attribute)
-				nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
-				self.cut_edge(edge_2)
-			tree.remove_edges_from(self.removing_edges)
-			tree.remove_nodes_from(self.removing_nodes)
-			self.removing_edges = []
-			self.removing_nodes = []
+		# A merge removes an edge and widens another, so the pairs are listed
+		# again after each one: a stale pair would name a removed edge, and the
+		# widened edge may now be contiguous with a sibling it wasn't before.
+		merged = True
+		while merged:
+			merged = False
+			for edge_1, edge_2 in itertools.combinations(list(tree.edges([n])), 2):
+				range_1 = edges[edge_1]['range']
+				range_2 = edges[edge_2]['range']
+				if Rule.contiguous(range_1, range_2, attribute=attribute) \
+					and self.subtree_equal(edge_1, edge_2):
+					result = Rule.combine_range(range_1, range_2, attribute=attribute)
+					nx.set_edge_attributes(tree, {edge_1 : result}, 'range')
+					self.removing_edges = []
+					self.removing_nodes = []
+					self.cut_edge(edge_2)
+					tree.remove_edges_from(self.removing_edges)
+					tree.remove_nodes_from(self.removing_nodes)
+					merged = True
+					break
 
 	def cut_edge(self, edge):
 		'''

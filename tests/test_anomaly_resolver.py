@@ -88,16 +88,29 @@ class MergeTests(unittest.TestCase):
 	def test_rules_below_siblings_with_the_same_range_are_kept(self):
 		# Issue #5: merging 1-5 and 6-10 left two 1-10 edges below each source,
 		# the sources were then taken as equal, and the DENY rule was dropped.
-		# Only this order, the full range first, avoids the KeyError in #7.
-		self.assertEqual(self.merge(self.issue_5_rules((0, 1, 2))), self.ISSUE_5_MERGED)
+		# With a half range listed first, merge() also used to raise KeyError
+		# (#7), so every insertion order is checked.
+		for order in itertools.permutations(range(3)):
+			with self.subTest(order=order):
+				self.assertEqual(self.merge(self.issue_5_rules(order)), self.ISSUE_5_MERGED)
 
-	@unittest.expectedFailure
-	def test_issue_5_rules_in_the_other_insertion_orders(self):
-		# Known limitation: with a half range listed first, merge() raises
-		# KeyError at the tp_src node (#7), on master and with the #5 fix.
-		# Remove expectedFailure once #7 is fixed.
-		for order in [(1, 2, 0), (1, 0, 2)]:
-			self.assertEqual(self.merge(self.issue_5_rules(order)), self.ISSUE_5_MERGED)
+	def port_rules(self, ports):
+		# Rules that differ only in their destination port.
+		return [Rule(nw_src='1.1.1.1', tp_src='80', nw_dst='2.2.2.2', tp_dst=port, actions='ALLOW')
+			for port in ports]
+
+	def test_a_merge_at_a_node_with_three_children_does_not_raise(self):
+		# Issue #7: the pairs at a node were listed once, so after 22 and 23
+		# merged, the pair (23, 443) named a removed edge and raised KeyError.
+		self.assertEqual([path[5] for path in self.merge(self.port_rules(['22', '23', '443']))],
+			['22-23', '443'])
+
+	def test_contiguous_ranges_merge_fully_in_any_order(self):
+		# A widened range can become contiguous with a sibling that was already
+		# compared, so merging repeats until nothing more merges.
+		for ports in itertools.permutations(['100-110', '111-120', '121-130']):
+			with self.subTest(order=ports):
+				self.assertEqual([path[5] for path in self.merge(self.port_rules(ports))], ['100-130'])
 
 	def hand_built_tree(self, subtrees):
 		# A root edge for each node, and below it one (range, action) path per child.
@@ -167,21 +180,22 @@ class MergeTests(unittest.TestCase):
 
 	def test_merging_keeps_every_rule_in_random_variants_of_issue_5(self):
 		# Each source gets a full tp_src range plus two halves that merge into
-		# it, with random destinations and actions. The full range always comes
-		# first, since the other orders hit the KeyError in #7.
+		# it, with random destinations and actions, listed in a random order.
 		generator = random.Random(9)
 		sources = ['10.0.0.1', '10.0.0.2']
 		for _ in range(150):
 			rules = list()
 			for source in sources:
-				rules.append(Rule(nw_src=source, tp_src='1-10', tp_dst='80',
+				pieces = [Rule(nw_src=source, tp_src='1-10', tp_dst='80',
 					nw_dst='10.0.1.%d' % generator.randrange(1, 4),
-					actions=generator.choice(['ALLOW', 'DENY'])))
+					actions=generator.choice(['ALLOW', 'DENY']))]
 				destination = '10.0.1.%d' % generator.randrange(1, 4)
 				action = generator.choice(['ALLOW', 'DENY'])
 				for ports in ['1-5', '6-10']:
-					rules.append(Rule(nw_src=source, tp_src=ports, tp_dst='80',
+					pieces.append(Rule(nw_src=source, tp_src=ports, tp_dst='80',
 						nw_dst=destination, actions=action))
+				generator.shuffle(pieces)
+				rules.extend(pieces)
 			expected = set((rule.nw_src, rule.nw_dst, rule.actions) for rule in rules)
 			merged = set()
 			for path in self.merge(rules):
@@ -191,15 +205,34 @@ class MergeTests(unittest.TestCase):
 						merged.add((source, path[4], path[6]))
 			self.assertEqual(merged, expected, '%s -> %s' % (rules, self.paths()))
 
+	# Values drawn from aligned pieces so that merges are common.
+	RANDOM_CHOICES = {'nw_src': ['10.0.0.0', '10.0.0.1', '10.0.0.0-10.0.0.1'],
+		'tp_src': ['1-2', '3-4', '1-4'], 'nw_dst': ['10.0.1.0-10.0.1.1',
+		'10.0.1.2-10.0.1.3', '10.0.1.0-10.0.1.3'], 'tp_dst': ['1', '2', '1-2']}
+	RANDOM_ORDER = ['nw_src', 'tp_src', 'nw_dst', 'tp_dst']
+
+	def random_rules(self, generator):
+		rules = dict()
+		for _ in range(generator.randrange(3, 10)):
+			key = tuple(generator.choice(self.RANDOM_CHOICES[field]) for field in self.RANDOM_ORDER)
+			rules.setdefault(key, generator.choice(['ALLOW', 'ALLOW', 'DENY']))
+		return [Rule(actions=action, **dict(zip(self.RANDOM_ORDER, key))) for key, action in rules.items()]
+
+	def test_merged_rules_do_not_depend_on_insertion_order(self):
+		# Merging repeats until nothing more merges, so the same rules give the
+		# same merged rules whatever order they were inserted in.
+		generator = random.Random(6)
+		for _ in range(60):
+			rules = self.random_rules(generator)
+			shuffled = rules[:]
+			generator.shuffle(shuffled)
+			self.assertEqual(set(map(tuple, self.merge(rules))), set(map(tuple, self.merge(shuffled))))
+
 	def test_merging_keeps_the_actions_every_packet_can_reach(self):
 		# Every root-to-leaf path is a rule, so a merge must not change which
-		# actions each packet can reach. Values are drawn from aligned pieces
-		# so that merges are common.
+		# actions each packet can reach.
 		generator = random.Random(5)
-		choices = {'nw_src': ['10.0.0.0', '10.0.0.1', '10.0.0.0-10.0.0.1'],
-			'tp_src': ['1-2', '3-4', '1-4'], 'nw_dst': ['10.0.1.0-10.0.1.1',
-			'10.0.1.2-10.0.1.3', '10.0.1.0-10.0.1.3'], 'tp_dst': ['1', '2', '1-2']}
-		order = ['nw_src', 'tp_src', 'nw_dst', 'tp_dst']
+		order = self.RANDOM_ORDER
 
 		def bounds(key, value):
 			values = Rule.ipstr2range(value) if key.startswith('nw') else Rule.portstr2range(value)
@@ -219,12 +252,7 @@ class MergeTests(unittest.TestCase):
 
 		merged_cases = 0
 		for _ in range(60):
-			rules = dict()
-			for _ in range(generator.randrange(3, 10)):
-				key = tuple(generator.choice(choices[field]) for field in order)
-				rules.setdefault(key, generator.choice(['ALLOW', 'ALLOW', 'DENY']))
-			self.resolver.construct_rule_tree([Rule(actions=action, **dict(zip(order, key)))
-				for key, action in rules.items()], plot=False)
+			self.resolver.construct_rule_tree(self.random_rules(generator), plot=False)
 			before, paths_before = reachable(), len(self.paths())
 			self.resolver.merge(self.resolver.get_rule_tree_root())
 			merged_cases += len(self.paths()) < paths_before

@@ -1159,6 +1159,253 @@ class RedundancyRemovalTests(unittest.TestCase):
 					'%s changed for %s -> %s' % (packet, rules, kept))
 
 
+class SwitchAndVlanTests(unittest.TestCase):
+	# Issue #12: Ryu installs a rule for switch or vlan 'all' on every switch
+	# and for every VLAN, so 'all' overlaps each specific value, and a rule
+	# for one switch is the more specific. The expected decisions come from
+	# the helpers below, which compare the generated values directly rather
+	# than with Rule.issubset: a rule strictly inside another wins, and DENY
+	# wins between rules that only overlap.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	@staticmethod
+	def fields(rule):
+		return {'switch': rule.switch, 'vlan': rule.vlan, 'actions': rule.actions,
+			'nw_src': Rule.range_bounds('ip', rule.nw_src),
+			'tp_dst': Rule.range_bounds('port', rule.tp_dst)}
+
+	@staticmethod
+	def matches(rule_fields, packet):
+		switch, vlan, source, port = packet
+		return rule_fields['switch'] in ('all', switch) and rule_fields['vlan'] in ('all', vlan) and \
+			rule_fields['nw_src'][0] <= source <= rule_fields['nw_src'][1] and \
+			rule_fields['tp_dst'][0] <= port <= rule_fields['tp_dst'][1]
+
+	@staticmethod
+	def inside(inner, outer):
+		return all(outer[key] in ('all', inner[key]) for key in ('switch', 'vlan')) and \
+			all(outer[key][0] <= inner[key][0] and inner[key][1] <= outer[key][1]
+				for key in ('nw_src', 'tp_dst'))
+
+	def expected(self, originals, packet):
+		matching = [rule_fields for rule_fields in originals if self.matches(rule_fields, packet)]
+		most_specific = [rule_fields for rule_fields in matching if not any(
+			self.inside(other, rule_fields) and not self.inside(rule_fields, other)
+			for other in matching)]
+		if not most_specific:
+			return None
+		return 'DENY' if any(rule_fields['actions'] == 'DENY'
+			for rule_fields in most_specific) else 'ALLOW'
+
+	def decision(self, resolved, packet):
+		return next((rule_fields['actions'] for rule_fields in resolved
+			if self.matches(rule_fields, packet)), None)
+
+	def assertDecisionsFollowThePolicy(self, rules, resolved, packets):
+		originals = [self.fields(rule) for rule in rules]
+		resolved = [self.fields(rule) for rule in resolved]
+		for packet in packets:
+			self.assertEqual(self.decision(resolved, packet), self.expected(originals, packet),
+				'%s for %s -> %s' % (packet, originals, resolved))
+
+	def decisions(self, rules, packets):
+		resolved = [self.fields(rule) for rule in self.resolver.resolve_anomalies(rules)]
+		return dict((packet, self.decision(resolved, packet)) for packet in packets)
+
+	def test_all_holds_every_switch_and_vlan(self):
+		for field in ['switch', 'vlan']:
+			with self.subTest(field=field):
+				everywhere = Rule(**{field: 'all'})
+				one, same, other = Rule(**{field: '1'}), Rule(**{field: '1'}), Rule(**{field: '2'})
+				self.assertFalse(everywhere.disjoint(one))
+				self.assertFalse(one.disjoint(everywhere))
+				self.assertFalse(one.disjoint(same))
+				self.assertTrue(one.disjoint(other))
+				self.assertTrue(one.issubset(everywhere))
+				self.assertFalse(everywhere.issubset(one))
+				self.assertTrue(one.issubset(same))
+				self.assertFalse(one.issubset(other))
+
+	def test_issue_example(self):
+		# The ALLOW for 'all' counted as disjoint from the switch 1 rules, so
+		# the host DENY was removed as redundant and 10.0.0.1:80 became allowed
+		# on switch 1. The rest of 10.0.0.0/24 on switch 1 is DENY too: the
+		# catch-all for switch 1 and the /24 for 'all' are each more specific
+		# in one field, so they only overlap, and DENY wins, as since #4.
+		host = Rule.range_bounds('ip', '10.0.0.1')[0]
+		rules = [Rule(switch='1', nw_src='10.0.0.1', tp_dst='80', actions='DENY'),
+			Rule(switch='all', nw_src='10.0.0.0/24', tp_dst='80', actions='ALLOW'),
+			Rule(switch='1', nw_src='*', tp_dst='80', actions='DENY')]
+		packets = [(switch, 'all', host + offset, 80) for switch in ['1', '2'] for offset in [0, 1, 256]]
+		self.assertEqual(list(self.decisions(rules, packets).values()),
+			['DENY', 'DENY', 'DENY', 'ALLOW', 'ALLOW', None])
+
+	def test_exception_for_one_switch_survives_the_same_rule_for_all(self):
+		# The rules match the same packets, but the switch 1 rule is more
+		# specific, so switch 1 allows 10.0.0.1 while other switches deny it.
+		host = Rule.range_bounds('ip', '10.0.0.1')[0]
+		for field in ['switch', 'vlan']:
+			with self.subTest(field=field):
+				rules = [Rule(nw_src='10.0.0.1', actions='DENY'),
+					Rule(nw_src='10.0.0.1', actions='ALLOW', **{field: '1'})]
+				packets = [('1', 'all', host, 80), ('2', 'all', host, 80)] if field == 'switch' \
+					else [('all', '1', host, 80), ('all', '2', host, 80)]
+				self.assertEqual(list(self.decisions(rules, packets).values()), ['ALLOW', 'DENY'])
+
+	def test_detection_and_resolution_agree_across_switches(self):
+		# Detection compares the rules as written. Resolution decides from
+		# the same rules, so a host for switch 1 inside a subnet for 'all' is
+		# nested for both, and a host for 'all' against a subnet for switch 1
+		# is a correlation for both, resolved to DENY.
+		host = Rule.range_bounds('ip', '10.0.0.1')[0]
+		cases = [('1', 'all', 'Shadowing Anomaly', 'ALLOW'),
+			('all', '1', 'Correlation Anomaly', 'DENY')]
+		for host_switch, subnet_switch, anomaly, decision in cases:
+			with self.subTest(host_switch=host_switch):
+				rules = [Rule(switch=host_switch, nw_src='10.0.0.1', actions='ALLOW'),
+					Rule(switch=subnet_switch, nw_src='10.0.0.0/24', actions='DENY')]
+				with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+					self.resolver.detect_anomalies(rules)
+				self.assertIn('%s\n\t%s\n\t%s' % (anomaly, rules[0], rules[1]),
+					[record.getMessage() for record in logs.records])
+				self.assertEqual(self.decisions(rules, [('1', 'all', host, 80)]),
+					{('1', 'all', host, 80): decision})
+
+	def test_correlated_overlap_across_switches_fails_closed(self):
+		# Each rule is more specific in one field. Whichever one allows, the
+		# packets both match are denied; each rule decides the rest alone.
+		host = Rule.range_bounds('ip', '10.0.0.1')[0]
+		packets = [('1', 'all', host, 80), ('1', 'all', host + 1, 80), ('2', 'all', host, 80)]
+		for host_action, subnet_action in [('ALLOW', 'DENY'), ('DENY', 'ALLOW')]:
+			with self.subTest(host_action=host_action):
+				rules = [Rule(nw_src='10.0.0.1', actions=host_action),
+					Rule(switch='1', nw_src='10.0.0.0/24', actions=subnet_action)]
+				self.assertEqual(list(self.decisions(rules, packets).values()),
+					['DENY', subnet_action, host_action])
+
+	def test_scopes_list_specific_pairs_first(self):
+		# Switch 1 with any VLAN has no rules of its own: they all apply to
+		# ('all', 'all') as well, so that pair decides it.
+		rules = [Rule(switch='2'), Rule(vlan='5'), Rule(switch='1', vlan='5')]
+		self.assertEqual(AnomalyResolver.scopes(rules),
+			[('1', '5'), ('2', '5'), ('2', 'all'), ('all', '5'), ('all', 'all')])
+		self.assertEqual(AnomalyResolver.scopes([Rule(), Rule()]), [('all', 'all')])
+
+	def test_pairs_without_rules_of_their_own_are_not_made(self):
+		# Every named switch was combined with every named VLAN, and each pair
+		# got copies of the rules for 'all', so these four rules became 19.
+		rules = [Rule(switch='1', vlan='5', nw_src='10.0.0.1', actions='DENY'),
+			Rule(switch='2', vlan='6', nw_src='10.0.0.2', actions='ALLOW'),
+			Rule(nw_src='10.0.0.0/24', actions='ALLOW'),
+			Rule(nw_src='10.0.0.0/16', actions='DENY')]
+		self.assertEqual(AnomalyResolver.scopes(rules), [('1', '5'), ('2', '6'), ('all', 'all')])
+		resolved = self.resolver.resolve_anomalies(rules)
+		self.assertEqual([(rule.switch, rule.vlan, rule.nw_src, rule.actions) for rule in resolved], [
+			('1', '5', '10.0.0.1', 'DENY'), ('1', '5', '10.0.0.0/24', 'ALLOW'),
+			('1', '5', '10.0.0.0/16', 'DENY'), ('2', '6', '10.0.0.0/24', 'ALLOW'),
+			('2', '6', '10.0.0.0/16', 'DENY'), ('all', 'all', '10.0.0.0/24', 'ALLOW'),
+			('all', 'all', '10.0.0.0/16', 'DENY')])
+		base = Rule.range_bounds('ip', '10.0.0.0')[0]
+		packets = itertools.product(['1', '2', '3'], ['5', '6', '7'],
+			[base, base + 1, base + 2, base + 256, base + 65536], [80])
+		self.assertDecisionsFollowThePolicy(rules, resolved, packets)
+
+	def test_pair_with_rules_of_its_own_gets_the_rules_for_all(self):
+		rules = [Rule(vlan='5', nw_src='10.0.0.1', actions='DENY'),
+			Rule(nw_src='10.0.0.0/24', actions='ALLOW'),
+			Rule(nw_src='10.0.0.0/16', actions='DENY')]
+		self.assertEqual(AnomalyResolver.scopes(rules), [('all', '5'), ('all', 'all')])
+		resolved = [(rule.vlan, rule.nw_src, rule.actions)
+			for rule in self.resolver.resolve_anomalies(rules)]
+		self.assertEqual(resolved[:3], [('5', '10.0.0.1', 'DENY'),
+			('5', '10.0.0.0/24', 'ALLOW'), ('5', '10.0.0.0/16', 'DENY')])
+
+	def test_none_sorts_before_named_switches_and_vlans(self):
+		# None is kept as a value of its own, like any other ID: it just
+		# sorts first, and the order doesn't depend on the order of the rules.
+		for field in ['switch', 'vlan']:
+			for named in [['1'], ['2', '1']]:
+				with self.subTest(field=field, named=named):
+					rules = [Rule(nw_src='10.0.0.%d' % index, **{field: value})
+						for index, value in enumerate([None] + named)]
+					order = [None] + sorted(named) + ['all']
+					expected = [(value, 'all') if field == 'switch' else ('all', value)
+						for value in order]
+					for permutation in itertools.permutations(rules):
+						self.assertEqual(AnomalyResolver.scopes(list(permutation)), expected)
+					resolved = self.resolver.resolve_anomalies(rules)
+					self.assertEqual(collections.Counter((getattr(rule, field), rule.nw_src)
+						for rule in resolved), collections.Counter((getattr(rule, field), rule.nw_src)
+						for rule in rules), 'each rule is kept with its own ' + field)
+
+	def test_detection_reports_an_overlap_with_a_rule_for_all(self):
+		host = Rule(switch='1', nw_src='10.0.0.1', tp_dst='80', actions='DENY')
+		subnet = Rule(nw_src='10.0.0.0/24', tp_dst='80', actions='ALLOW')
+		with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+			self.resolver.detect_anomalies([host, subnet])
+		self.assertIn('Shadowing Anomaly\n\t%s\n\t%s' % (host, subnet),
+			[record.getMessage() for record in logs.records])
+
+	def test_redundancy_removal_compares_switches(self):
+		# A rule for one switch inside a later rule for 'all' with the same
+		# action is redundant, but not the other way around.
+		host = Rule(switch='1', nw_src='10.0.0.1', actions='DENY')
+		everyone = Rule(nw_src='*', actions='DENY')
+		kept = self.resolver.remove_redundant_rules([host, everyone])
+		self.assertEqual(len(kept), 1)
+		self.assertIs(kept[0], everyone)
+		host = Rule(nw_src='10.0.0.1', actions='DENY')
+		everyone = Rule(switch='1', nw_src='*', actions='DENY')
+		self.assertEqual(len(self.resolver.remove_redundant_rules([host, everyone])), 2)
+
+	def test_copies_of_rules_for_all_are_removed_when_redundant(self):
+		# Switch 1 is resolved with a copy of the subnet ALLOW for 'all'. The
+		# rule for 'all' that follows makes that copy redundant.
+		host = Rule(switch='1', nw_src='10.0.0.1', actions='DENY')
+		subnet = Rule(nw_src='10.0.0.0/24', actions='ALLOW')
+		resolved = self.resolver.resolve_anomalies([host, subnet])
+		self.assertEqual([(rule.switch, rule.nw_src, rule.actions) for rule in resolved],
+			[('1', '10.0.0.1', 'DENY'), ('all', '10.0.0.0/24', 'ALLOW')])
+
+	def test_resolved_decisions_follow_the_policy_on_every_switch_and_vlan(self):
+		# Rules for 'all' and for named switches and VLANs, checked for every
+		# packet in a small space, on named and unnamed switches and VLANs.
+		generator = random.Random(12)
+		base = Rule.range_bounds('ip', '10.0.0.0')[0]
+
+		def random_range(low, high):
+			first = generator.randint(low, high)
+			return first, generator.randint(first, high)
+
+		def random_rule():
+			source, port = random_range(0, 3), random_range(1, 3)
+			return Rule(switch=generator.choice(['1', '2', 'all', 'all']),
+				vlan=generator.choice(['5', '6', 'all', 'all']),
+				nw_src='*' if generator.random() < 0.15 else '10.0.0.%d-10.0.0.%d' % source,
+				tp_dst='*' if generator.random() < 0.15 else '%d-%d' % port,
+				actions=generator.choice(['ALLOW', 'DENY']))
+
+		packets = list(itertools.product(['1', '2', '3'], ['5', '6', '7'],
+			[base + source for source in range(5)], range(5)))
+		mixed = 0
+		for _ in range(150):
+			rules = [random_rule() for _ in range(generator.randrange(2, 7))]
+			before = [rule.__repr__('detail') for rule in rules]
+			resolved = self.resolver.resolve_anomalies(rules)
+			self.assertEqual([rule.__repr__('detail') for rule in rules], before)
+			self.assertDecisionsFollowThePolicy(rules, resolved, packets)
+			originals = [self.fields(rule) for rule in rules]
+			mixed += sum(len(set(rule_fields['switch'] == 'all' for rule_fields in originals
+				if self.matches(rule_fields, packet))) == 2 for packet in packets)
+		# Rules for 'all' and for one switch often match the same packet.
+		self.assertGreater(mixed, 500)
+
+
 class SpeedTests(unittest.TestCase):
 	# Issue #10: every port check built a set of up to 65,536 values, address
 	# checks built IPSets, split() listed every port of the range it split, and

@@ -540,26 +540,21 @@ class AnomalyResolver:
 		for switch, vlan in scopes:
 			if len(scopes) > 1:
 				self.resolver_logger.info('Resolving switch %s, vlan %s', switch, vlan)
-			# The rules that apply on this switch and VLAN, narrowed to it. Ryu
-			# installs a rule for 'all' on every switch and for every VLAN, so
-			# here it is just another rule; the pieces of a rule for 'all'
-			# couldn't be split by switch or VLAN anyway.
-			scope_rules = list()
+			# insert() and split() change the rules they are given, so resolve
+			# copies: copies of the rules that apply on this switch and VLAN,
+			# narrowed to it, as the pieces of a rule for 'all' can't be split
+			# by switch or VLAN. The narrowing only places the pieces. The
+			# caller's rules, unchanged and with the switch and VLAN they were
+			# written for, decide the action of each piece afterwards: a rule
+			# for one switch is more specific than the same rule for 'all'.
+			pieces = list()
 			for rule in old_rules_list:
 				if Rule.scopeinrange(switch, rule.switch) and Rule.scopeinrange(vlan, rule.vlan):
-					scope_rule = Rule()
-					scope_rule.set_fields(rule)
-					scope_rule.switch, scope_rule.vlan = switch, vlan
-					scope_rules.append(scope_rule)
-			# insert() and split() change the rules they are given, so resolve
-			# copies. The narrowed rules stay unchanged and decide the action of
-			# each piece afterwards; the caller's rules are never changed.
-			pieces = list()
-			for rule in scope_rules:
-				working_rule = Rule()
-				working_rule.set_fields(rule)
-				self.insert(working_rule, pieces)
-			self.set_actions(pieces, scope_rules)
+					working_rule = Rule()
+					working_rule.set_fields(rule)
+					working_rule.switch, working_rule.vlan = switch, vlan
+					self.insert(working_rule, pieces)
+			self.set_actions(pieces, old_rules_list)
 			new_rules_list.extend(pieces)
 		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
@@ -579,9 +574,27 @@ class AnomalyResolver:
 		# resolved rules for a pair decide every packet there that any rule
 		# matches, so pairs with more named parts come first, and each later
 		# pair only decides packets that no earlier pair covers.
-		switches = sorted(set(rule.switch for rule in rules_list) - {'all'}) + ['all']
-		vlans = sorted(set(rule.vlan for rule in rules_list) - {'all'}) + ['all']
-		return sorted(itertools.product(switches, vlans), key=lambda scope: scope.count('all'))
+		def named(values):
+			# IDs are strings, but a field can also hold None, which sorts first.
+			return sorted(set(values) - {'all'},
+				key=lambda value: (value is not None, value or '')) + ['all']
+
+		def applicable(scope):
+			return frozenset(index for index, rule in enumerate(rules_list)
+				if Rule.scopeinrange(scope[0], rule.switch) and Rule.scopeinrange(scope[1], rule.vlan))
+
+		pairs = sorted(itertools.product(named(rule.switch for rule in rules_list),
+			named(rule.vlan for rule in rules_list)), key=lambda scope: scope.count('all'))
+		# A pair adds nothing when every rule for it also applies to the first
+		# later pair that covers it, which then decides its packets the same
+		# way. So rules for 'all' alone never make a pair of their own.
+		kept = list()
+		for scope in reversed(pairs):
+			fallback = next((later for later in kept if Rule.scopeinrange(scope[0], later[0])
+				and Rule.scopeinrange(scope[1], later[1])), None)
+			if fallback is None or applicable(scope) != applicable(fallback):
+				kept.insert(0, scope)
+		return kept
 
 	def set_actions(self, rules_list, original_rules):
 		'''

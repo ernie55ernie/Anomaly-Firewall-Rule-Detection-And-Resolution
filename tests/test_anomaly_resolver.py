@@ -626,6 +626,21 @@ class ParserTests(unittest.TestCase):
 		reports = [record.getMessage() for record in logs.records if 'Anomaly' in record.getMessage()]
 		self.assertEqual(reports, ['Shadowing Anomaly\n\t%s\n\t%s' % (icmpv6, later_icmpv6)])
 
+	def test_icmp_line_with_ports_is_rejected(self):
+		# Issue #40: only TCP and UDP have ports.
+		for line, parts in [('1. <IN, ICMP, 10.0.0.1, 80, ANY, 8080, ACCEPT>', ['ICMP rule', "tp_src '80'"]),
+				('1. <IN, ICMPv6, ANY, ANY, ANY, 80, ACCEPT>', ['ICMPv6 rule', "tp_dst '80'"])]:
+			with self.subTest(line=line):
+				with self.assertRaises(ValueError) as error:
+					self.parse(line)
+				for part in parts + ["can't have ports", 'on line 1']:
+					self.assertIn(part, str(error.exception))
+		for line in ['1. <IN, ICMP, 10.0.0.1, ANY, ANY, ANY, ACCEPT>',
+				'1. <IN, ICMP, 10.0.0.1, 0-65535, ANY, *, ACCEPT>']:
+			with self.subTest(line=line):
+				rule = self.parse(line)[0]
+				self.assertEqual((rule.nw_proto, rule.tp_src, rule.tp_dst), ('ICMP', '*', '*'))
+
 	def test_any_protocol_is_rejected(self):
 		# A rules-file rule is IPv4 or IPv6, and needs a protocol: ANY would
 		# mean it has none, which only an ARP rule can.
@@ -1854,6 +1869,49 @@ class ArpTests(unittest.TestCase):
 		self.assertTrue(Rule(dl_type='ARP', dl_src='aa:aa:aa:aa:aa:aa').disjoint(
 			Rule(dl_type='ARP', dl_src='bb:bb:bb:bb:bb:bb')))
 		self.assertTrue(allow.disjoint(Rule(actions='DENY')))
+
+
+class IcmpPortTests(unittest.TestCase):
+	# Issue #40: ICMP and ICMPv6 messages have no ports, but their rules could
+	# still carry ports, which were compared as if they applied: a rule for
+	# port 80 counted as inside the rule for any port, not the other way
+	# round, and rules for ports 80 and 81 as disjoint.
+
+	def test_icmp_rules_have_no_ports(self):
+		for fields, parts in [(dict(nw_proto='ICMP', tp_dst='80'), ['ICMP rule', 'ports', "tp_dst '80'"]),
+				(dict(nw_proto='icmp', tp_src='1024-65535'), ['ICMP rule', 'ports', "tp_src '1024-65535'"]),
+				(dict(dl_type='IPv6', nw_proto='ICMPv6', tp_dst='8080'), ['ICMPv6 rule', 'ports', "tp_dst '8080'"])]:
+			with self.subTest(fields=fields):
+				with self.assertRaises(ValueError) as error:
+					Rule(**fields)
+				for part in parts:
+					self.assertIn(part, str(error.exception))
+		# Ports that don't constrain the rule are accepted, and are the default.
+		for fields in [dict(nw_proto='ICMP'), dict(nw_proto='ICMP', tp_src='0-65535', tp_dst='ANY'),
+				dict(dl_type='IPv6', nw_proto='ICMPv6', tp_dst='*')]:
+			with self.subTest(fields=fields):
+				rule = Rule(**fields)
+				self.assertEqual((rule.tp_src, rule.tp_dst), ('*', '*'))
+		# TCP and UDP keep their ports, over IPv4 and IPv6.
+		for fields, expected in [(dict(nw_proto='TCP', tp_dst='80'), ('*', '80')),
+				(dict(nw_proto='UDP', tp_src='53'), ('53', '*')),
+				(dict(dl_type='IPv6', nw_proto='UDP', tp_dst='53'), ('*', '53'))]:
+			with self.subTest(fields=fields):
+				rule = Rule(**fields)
+				self.assertEqual((rule.tp_src, rule.tp_dst), expected)
+
+	def test_icmp_rules_compare_on_the_fields_that_apply(self):
+		# The issue's rules can't be built any more. ICMP rules now differ only
+		# in fields that apply to ICMP, such as the addresses.
+		for port in ['80', '81']:
+			with self.assertRaises(ValueError):
+				Rule(nw_proto='ICMP', tp_dst=port)
+		host = Rule(nw_proto='ICMP', nw_src='10.0.0.1', actions='ALLOW')
+		everyone = Rule(nw_proto='ICMP', tp_src='0-65535', actions='DENY')
+		self.assertTrue(host.issubset(everyone))
+		self.assertFalse(everyone.issubset(host))
+		self.assertFalse(host.disjoint(everyone))
+		self.assertTrue(Rule(nw_proto='ICMP').issubset(Rule(nw_proto='ICMP', tp_dst='ANY')))
 
 
 def product_scopes(rules):

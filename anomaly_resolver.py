@@ -168,13 +168,16 @@ class Rule(ctypes.Structure):
 				raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
 		if protocol_family and dl_type != protocol_family:
 			raise ValueError('nw_proto %s needs dl_type %s, not %s' % (nw_proto, protocol_family, dl_type))
-		# An ARP rule with an IP protocol or a port could match nothing.
-		if dl_type == 'ARP':
-			if nw_proto != '*':
-				raise ValueError("An ARP rule can't have an IP protocol: nw_proto %s" % (nw_proto,))
+		# An ARP rule with an IP protocol could match nothing. Nor could a
+		# rule with a port unless its protocol is TCP or UDP: ARP packets have
+		# no ports, and ICMP and ICMPv6 messages have none either.
+		if dl_type == 'ARP' and nw_proto != '*':
+			raise ValueError("An ARP rule can't have an IP protocol: nw_proto %s" % (nw_proto,))
+		if nw_proto not in ('TCP', 'UDP'):
 			for field, value in [('tp_src', tp_src), ('tp_dst', tp_dst)]:
 				if value != '*':
-					raise ValueError("An ARP rule can't have ports: %s %r" % (field, value))
+					raise ValueError("An %s rule can't have ports: %s %r"
+						% ('ARP' if dl_type == 'ARP' else nw_proto, field, value))
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \

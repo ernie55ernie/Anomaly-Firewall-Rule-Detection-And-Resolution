@@ -127,6 +127,14 @@ class Rule(ctypes.Structure):
 		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
 		direction = Rule._sanity_check(direction, field = 'direction')
 		actions = Rule._sanity_check(actions, field = 'action')
+		# IPv4 addresses only match IPv4 packets, and IPv6 addresses IPv6
+		# packets, so any other combination is a rule that matches nothing.
+		# dl_type defaults to IPv4, so an IPv6 address needs dl_type='IPv6'.
+		for family, fields in [('IPv4', {'nw_src': nw_src, 'nw_dst': nw_dst}),
+				('IPv6', {'ipv6_src': ipv6_src, 'ipv6_dst': ipv6_dst})]:
+			for field, value in fields.items():
+				if value != '*' and dl_type != family:
+					raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \
@@ -461,8 +469,13 @@ class Rule(ctypes.Structure):
 	def _range_type(attribute, r_1, r_2):
 		if attribute in ['nw_src', 'nw_dst']:
 			return 'ip'
+		if attribute in ['ipv6_src', 'ipv6_dst']:
+			return 'ipv6'
 		if attribute in ['in_port', 'tp_src', 'tp_dst']:
 			return 'port'
+		# Before '.', which an IPv6 address can also hold, as in ::ffff:1.2.3.4.
+		if ':' in r_1 or ':' in r_2:
+			return 'ipv6'
 		if '.' in r_1 or '.' in r_2:
 			return 'ip'
 		if all(value == '*' or value.isdigit() or '-' in value for value in [r_1, r_2]):
@@ -493,6 +506,10 @@ class Rule(ctypes.Structure):
 			return Rule.portrange2str(
 				range(min(range_1[0], range_2[0]), max(range_1[-1], range_2[-1]) + 1)
 			)
+		if range_type == 'ipv6':
+			(start_1, end_1), (start_2, end_2) = [Rule.range_bounds('ipv6', value)
+				for value in (r_1, r_2)]
+			return Rule.bounds_range('ipv6', min(start_1, start_2), max(end_1, end_2))
 		return None
 
 	def range_bounds(kind, value):
@@ -532,6 +549,9 @@ class Rule(ctypes.Structure):
 		# The range string for integer bounds, written as split() writes ranges.
 		if kind == 'ip':
 			return Rule.iprange2str(IPRange(start, end))
+		if kind == 'ipv6':
+			# Name the version: small IPv6 bounds would otherwise read as IPv4.
+			return Rule.iprange2str(IPRange(IPAddress(start, 6), IPAddress(end, 6)))
 		return Rule.portrange2str(range(start, end + 1))
 
 class AnomalyResolver:
@@ -642,7 +662,6 @@ class AnomalyResolver:
 		return new_rules_list
 
 	@staticmethod
-	@staticmethod
 	def applies(rule, scope):
 		'''
 		Whether rule applies to scope, a value for each of scope_fields
@@ -662,33 +681,45 @@ class AnomalyResolver:
 		# rule matches, so combinations with more named values come first,
 		# and each later one only decides packets no earlier one covers.
 		fields = AnomalyResolver.scope_fields
+		wildcards = tuple(everything for _, everything in fields)
 
-		def named(field, everything):
-			# Values are strings, but a field can also hold None, which sorts
-			# first.
-			values = set(getattr(rule, field) for rule in rules_list) - {everything}
-			return sorted(values, key=lambda value: (value is not None, value or '')) + [everything]
+		def meet(first, second):
+			# The combination that both cover, or None when they name different
+			# values for a field.
+			result = list()
+			for everything, one, other in zip(wildcards, first, second):
+				if one != everything and other != everything and one != other:
+					return None
+				result.append(other if one == everything else one)
+			return tuple(result)
 
-		def applicable(scope):
-			return frozenset(index for index, rule in enumerate(rules_list)
-				if AnomalyResolver.applies(rule, scope))
+		# A combination has the same rules, and so decides the same packets,
+		# as the meet of the scopes of the rules that apply to it. So the
+		# only combinations needed are the scopes rules carry, the combination
+		# of all wildcards, and their meets. Their number follows the scopes
+		# rules actually carry, not the product of every value of every field.
+		# Each one also has rules of its own: every value it names comes from
+		# a rule that applies there but to no more general combination, so
+		# none of them can be left to a later one.
+		candidates = set([wildcards] + [tuple(getattr(rule, field) for field, _ in fields)
+			for rule in rules_list])
+		pending = list(candidates)
+		while pending:
+			scope = pending.pop()
+			for other in list(candidates):
+				combined = meet(scope, other)
+				if combined is not None and combined not in candidates:
+					candidates.add(combined)
+					pending.append(combined)
 
-		def covers(general, specific):
-			return all(Rule.scopeinrange(value, other, everything)
-				for (_, everything), value, other in zip(fields, specific, general))
+		# Most named values first. Within a count, in the order of the values,
+		# where None sorts before strings and the wildcard last.
+		def rank(value, everything):
+			return (value == everything, value is not None, value or '')
 
-		combinations = sorted(itertools.product(*[named(field, everything)
-			for field, everything in fields]), key=lambda scope: sum(value == everything
-			for (_, everything), value in zip(fields, scope)))
-		# A combination adds nothing when every rule for it also applies to
-		# the first later combination that covers it, which then decides its
-		# packets the same way. So rules for 'all' alone never make one.
-		kept = list()
-		for scope in reversed(combinations):
-			fallback = next((later for later in kept if covers(later, scope)), None)
-			if fallback is None or applicable(scope) != applicable(fallback):
-				kept.insert(0, scope)
-		return kept
+		return sorted(candidates, key=lambda scope: (sum(value == everything
+			for everything, value in zip(wildcards, scope)),
+			[rank(value, everything) for everything, value in zip(wildcards, scope)]))
 
 	def set_actions(self, rules_list, original_rules):
 		'''

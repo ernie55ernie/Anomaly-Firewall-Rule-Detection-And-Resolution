@@ -1480,7 +1480,8 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 				('ipv6_dst', '2001:db8::1-2001:db8::9', '2001:db8::1-2001:db8::9'),
 				('ipv6_dst', '2001:db8::5-2001:db8::5', '2001:db8::5')]:
 			with self.subTest(field=field, value=value):
-				self.assertEqual(getattr(Rule(**{field: value}), field), expected)
+				dl_type = 'IPv6' if field.startswith('ipv6') else 'IPv4'
+				self.assertEqual(getattr(Rule(dl_type=dl_type, **{field: value}), field), expected)
 		for field, value in [('dl_src', 'aa:bb:cc:dd:ee'), ('dl_src', 'aa-bb-cc-dd-ee-ff'),
 				('dl_src', 'aabb.ccdd.eeff'), ('dl_src', 'gg:bb:cc:dd:ee:ff'), ('dl_dst', 'a:bb:cc:dd:ee:ff'),
 				('dl_dst', ' aa:bb:cc:dd:ee:ff'), ('dl_dst', ''), ('dl_dst', None),
@@ -1489,7 +1490,7 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 				('ipv6_dst', 'fe80::1%eth0'), ('ipv6_dst', '2001:db8::g'), ('ipv6_dst', '1')]:
 			with self.subTest(field=field, value=value):
 				with self.assertRaises(ValueError):
-					Rule(**{field: value})
+					Rule(dl_type='IPv6' if field.startswith('ipv6') else 'IPv4', **{field: value})
 
 	def test_ipv6_ranges_are_split_as_ipv6(self):
 		# The pieces of a split must stay IPv6: bounds are integers, and a small
@@ -1500,6 +1501,93 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 		self.assertEqual(sorted((rule.ipv6_src, rule.tp_dst, rule.actions) for rule in resolved), [
 			('::-::4', '85-90', 'DENY'), ('::/120', '80-84', 'DENY'), ('::5-::a', '85-90', 'DENY'),
 			('::5-::a', '91-100', 'ALLOW'), ('::b-::ff', '85-90', 'DENY')])
+
+	def test_address_family_must_match_dl_type(self):
+		# IPv4 addresses match only IPv4 packets, and IPv6 addresses only IPv6
+		# ones, so any other combination could match nothing. dl_type defaults
+		# to IPv4.
+		rejected = [dict(ipv6_src='2001:db8::1'), dict(ipv6_dst='2001:db8::/32'),
+			dict(dl_type='IPv4', ipv6_src='2001:db8::1'), dict(dl_type='IPv4', ipv6_dst='2001:db8::1'),
+			dict(dl_type='IPv6', nw_src='10.0.0.1'), dict(dl_type='IPv6', nw_dst='10.0.0.0/24'),
+			dict(dl_type='ARP', nw_src='10.0.0.1'), dict(dl_type='ARP', ipv6_dst='2001:db8::1')]
+		for fields in rejected:
+			with self.subTest(fields=fields):
+				with self.assertRaises(ValueError):
+					Rule(**fields)
+		accepted = [dict(nw_src='10.0.0.1', nw_dst='10.0.1.0/24'),
+			dict(dl_type='IPv4', nw_src='10.0.0.1', nw_dst='10.0.1.1'),
+			dict(dl_type='IPv6', ipv6_src='2001:db8::1', ipv6_dst='2001:db8::/32'),
+			dict(dl_type='IPv6'), dict(dl_type='ARP')]
+		for fields in accepted:
+			with self.subTest(fields=fields):
+				rule = Rule(**fields)
+				self.assertEqual(dict((field, getattr(rule, field)) for field in fields), fields)
+
+	def test_rules_with_the_wrong_address_family_cannot_be_built(self):
+		# An IPv6 source on the default IPv4 rule counted as disjoint from the
+		# same source on an IPv6 rule, and as inside the IPv4 rule for every
+		# packet. Such a rule is now rejected, and written with dl_type IPv6
+		# it compares as expected.
+		with self.assertRaises(ValueError):
+			Rule(ipv6_src='2001:db8::1', actions='DENY')
+		with self.assertRaises(ValueError):
+			Rule(dl_type='IPv6', nw_src='10.0.0.1')
+		host = Rule(dl_type='IPv6', ipv6_src='2001:db8::1', actions='DENY')
+		network = Rule(dl_type='IPv6', ipv6_src='2001:db8::/32', actions='DENY')
+		self.assertTrue(host.issubset(network))
+		self.assertFalse(host.disjoint(network))
+		self.assertFalse(host.issubset(Rule()))
+		self.assertTrue(host.disjoint(Rule()))
+
+	def test_range_helpers_handle_ipv6(self):
+		# IPv6 ranges have their own path, with 128-bit bounds, rather than
+		# being read as ports or as IPv4.
+		self.assertEqual(Rule.range_bounds('ipv6', '::5'), (5, 5))
+		self.assertEqual(Rule.range_bounds('ipv6', '::/126'), (0, 3))
+		self.assertEqual(Rule.range_bounds('ipv6', '::5-::a'), (5, 10))
+		self.assertEqual(Rule.range_bounds('ipv6', '*'), (0, 2 ** 128 - 1))
+		for value in ['::5', '::5-::a', '2001:db8::/32', '2001:db8::1', '*']:
+			with self.subTest(value=value):
+				bounds = Rule.range_bounds('ipv6', value)
+				self.assertEqual(Rule.range_bounds('ipv6', Rule.bounds_range('ipv6', *bounds)), bounds)
+		self.assertEqual(Rule.bounds_range('ipv6', 5, 10), '::5-::a')
+		self.assertEqual(Rule.bounds_range('ip', 5, 10), '0.0.0.5-0.0.0.10')
+		self.assertEqual(Rule.bounds_range('port', 5, 10), '5-10')
+		for attribute, first, second, kind in [('ipv6_src', '::1', '*', 'ipv6'),
+				('ipv6_dst', '*', '*', 'ipv6'), (None, '::1', '::2', 'ipv6'),
+				(None, '::ffff:1.2.3.4', '*', 'ipv6'), (None, '10.0.0.1', '*', 'ip'),
+				('nw_src', '*', '*', 'ip'), (None, '80', '81-90', 'port'), ('tp_dst', '*', '*', 'port')]:
+			with self.subTest(attribute=attribute, first=first, second=second):
+				self.assertEqual(Rule._range_type(attribute, first, second), kind)
+		top = 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+		for first, second, expected in [('::1-::4', '::5-::8', True), ('::1', '::2', True),
+				('::1', '::3', False), ('::1-::5', '::5-::8', False), ('*', '::5-::a', False),
+				('2001:db8::/33', '2001:db8:8000::/33', True), (top, 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe', True),
+				('*', top, False), ('*', '*', False)]:
+			for attribute in ['ipv6_src', None]:
+				with self.subTest(first=first, second=second, attribute=attribute):
+					self.assertIs(Rule.contiguous(first, second, attribute=attribute), expected)
+					self.assertIs(Rule.contiguous(second, first, attribute=attribute), expected)
+		self.assertEqual(Rule.combine_range('::1-::4', '::5-::8', attribute='ipv6_dst'), '::1-::8')
+		with self.assertRaises(ValueError):
+			Rule.contiguous('10.0.0.1', '::1', attribute='ipv6_src')
+
+	def test_detection_and_resolution_agree_on_ipv6_ranges(self):
+		# A host inside a /32 is shadowing for detection and keeps the host's
+		# action; a host for every port against the /32 for one port is a
+		# correlation for both, resolved to DENY where they meet.
+		cases = [('*', '*', 'Shadowing Anomaly', 'ALLOW'), ('*', '80', 'Correlation Anomaly', 'DENY')]
+		for host_port, network_port, anomaly, decision in cases:
+			with self.subTest(network_port=network_port):
+				rules = [Rule(dl_type='IPv6', ipv6_src='2001:db8::1', tp_dst=host_port, actions='ALLOW'),
+					Rule(dl_type='IPv6', ipv6_src='2001:db8::/32', tp_dst=network_port, actions='DENY')]
+				with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+					self.resolver.detect_anomalies(rules)
+				self.assertIn('%s\n\t%s\n\t%s' % (anomaly, rules[0], rules[1]),
+					[record.getMessage() for record in logs.records])
+				resolved = self.resolver.resolve_anomalies(rules)
+				packet = Rule(dl_type='IPv6', ipv6_src='2001:db8::1', tp_dst='80')
+				self.assertEqual(first_match(resolved, packet), decision)
 
 	def test_resolved_decisions_follow_the_policy(self):
 		# Random rules over Ethernet types, MAC addresses, IPv6 ranges and
@@ -1516,12 +1604,15 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 			return first, generator.randint(first, high)
 
 		def random_rule():
+			# IPv6 addresses only on IPv6 rules: an ARP rule can't have one.
 			source, port = random_range(0, 4), random_range(1, 3)
-			return Rule(dl_type=generator.choice(['IPv6', 'IPv6', 'ARP']),
+			dl_type = generator.choice(['IPv6', 'IPv6', 'ARP'])
+			ipv6_src = generator.choice(['*', '::/126', '::4-::7']) if generator.random() < 0.3 \
+				else '::%x-::%x' % source
+			return Rule(dl_type=dl_type,
 				dl_src=generator.choice(macs['dl_src'][:2] + ['*', '*']),
 				dl_dst=generator.choice(macs['dl_dst'][:1] + ['*', '*']),
-				ipv6_src=generator.choice(['*', '::/126', '::4-::7']) if generator.random() < 0.3
-					else '::%x-::%x' % source,
+				ipv6_src=ipv6_src if dl_type == 'IPv6' else '*',
 				tp_dst='*' if generator.random() < 0.15 else '%d-%d' % port,
 				actions=generator.choice(['ALLOW', 'DENY']))
 
@@ -1574,6 +1665,88 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 		# every address often match the same packet.
 		self.assertGreater(outcomes['ipv6 split'], 20, outcomes)
 		self.assertGreater(outcomes['mixed macs'], 200, outcomes)
+
+
+def product_scopes(rules):
+	# scopes() before PR #35's review: every combination of the named values
+	# of every scope field, pruned the same way. Kept as the reference.
+	fields = AnomalyResolver.scope_fields
+
+	def named(field, everything):
+		values = set(getattr(rule, field) for rule in rules) - {everything}
+		return sorted(values, key=lambda value: (value is not None, value or '')) + [everything]
+
+	def applicable(scope):
+		return frozenset(index for index, rule in enumerate(rules)
+			if AnomalyResolver.applies(rule, scope))
+
+	def covers(general, specific):
+		return all(Rule.scopeinrange(value, other, everything)
+			for (_, everything), value, other in zip(fields, specific, general))
+
+	combinations = sorted(itertools.product(*[named(field, everything) for field, everything in fields]),
+		key=lambda scope: sum(value == everything for (_, everything), value in zip(fields, scope)))
+	kept = list()
+	for scope in reversed(combinations):
+		fallback = next((later for later in kept if covers(later, scope)), None)
+		if fallback is None or applicable(scope) != applicable(fallback):
+			kept.insert(0, scope)
+	return kept
+
+
+class ScopeTests(unittest.TestCase):
+	# scopes() lists the combinations of switch, VLAN and MAC addresses that
+	# resolution handles separately. It used to go through the product of
+	# every named value of the four fields.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def host_rules(self, count):
+		# Rules that each name their own switch, VLAN and MAC addresses, and a
+		# rule for every packet.
+		return [Rule(switch='s%d' % index, vlan='%d' % index, dl_src='aa:aa:aa:aa:aa:%02x' % index,
+			dl_dst='bb:bb:bb:bb:bb:%02x' % index, nw_src='10.0.0.%d' % index, actions='DENY')
+			for index in range(count)] + [Rule(actions='ALLOW')]
+
+	def test_scopes_match_the_product_of_every_value(self):
+		generator = random.Random(35)
+		values = {'switch': ['1', '2', 'all', None], 'vlan': ['5', '6', 'all'],
+			'dl_src': ['aa:aa:aa:aa:aa:aa', 'bb:bb:bb:bb:bb:bb', '*'], 'dl_dst': ['dd:dd:dd:dd:dd:dd', '*']}
+		for _ in range(400):
+			rules = list()
+			for _ in range(generator.randrange(1, 7)):
+				rule = Rule()
+				for field, choices in values.items():
+					setattr(rule, field, generator.choice(choices))
+				rules.append(rule)
+			with self.subTest(scopes=[tuple(getattr(rule, field) for field in values) for rule in rules]):
+				self.assertEqual(AnomalyResolver.scopes(rules), product_scopes(rules))
+
+	def test_candidates_follow_the_scopes_rules_carry(self):
+		# 16 rules naming 16 values in each of four fields made 17 ** 4 = 83,521
+		# combinations, and applies() ran for every rule on each.
+		rules = self.host_rules(16)
+		with mock.patch.object(AnomalyResolver, 'applies', wraps=AnomalyResolver.applies) as applies:
+			scopes = AnomalyResolver.scopes(rules)
+		self.assertEqual(len(scopes), 17)
+		self.assertLess(applies.call_count, 1000)
+
+	def test_rules_for_every_scope_still_apply_everywhere(self):
+		# The rule for every packet decides the rest of each named scope, and
+		# the scopes no rule names.
+		rules = self.host_rules(16)
+		resolved = self.resolver.resolve_anomalies(rules)
+		for index in [0, 7, 15]:
+			scope = dict(switch='s%d' % index, vlan='%d' % index, dl_src='aa:aa:aa:aa:aa:%02x' % index,
+				dl_dst='bb:bb:bb:bb:bb:%02x' % index)
+			self.assertEqual(first_match(resolved, Rule(nw_src='10.0.0.%d' % index, **scope)), 'DENY')
+			self.assertEqual(first_match(resolved, Rule(nw_src='10.0.0.99', **scope)), 'ALLOW')
+		self.assertEqual(first_match(resolved, Rule(switch='s99', nw_src='10.0.0.1')), 'ALLOW')
+		self.assertEqual(first_match(resolved, Rule(switch='s1', vlan='2', nw_src='10.0.0.1')), 'ALLOW')
 
 
 class SpeedTests(unittest.TestCase):

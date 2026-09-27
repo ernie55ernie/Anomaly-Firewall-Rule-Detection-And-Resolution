@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import random
 import subprocess
@@ -444,26 +445,60 @@ class SplitOrderTests(unittest.TestCase):
 		self.assertEqual(rule.find_attribute_set(Rule(nw_src='10.0.0.2', tp_src='1',
 			nw_dst='10.0.1.1', tp_dst='81')), ['tp_dst', 'nw_src'])
 
-	def test_resolved_rules_are_the_same_under_every_hash_seed(self):
+	# The fields compared for each resolved rule, and the rules expected from
+	# resolving the two rules in the test below. The DENY pieces make up the
+	# first rule; the ALLOW pieces are the second rule minus the overlap
+	# (sources .2-.5, destinations .2-.3, ports 2-4), which is DENY.
+	FIELDS = ['direction', 'nw_proto', 'in_port', 'nw_src', 'tp_src', 'nw_dst', 'tp_dst', 'actions']
+	EXPECTED = [
+		['IN', 'TCP', '1', '10.0.0.0-10.0.0.7', '1', '10.0.1.0-10.0.1.3', '1', 'DENY'],
+		['IN', 'TCP', '1', '10.0.0.2-10.0.0.5', '1', '10.0.1.2-10.0.1.6', '5-6', 'ALLOW'],
+		['IN', 'TCP', '1', '10.0.0.0-10.0.0.7', '1', '10.0.1.0-10.0.1.1', '2-4', 'DENY'],
+		['IN', 'TCP', '1', '10.0.0.2-10.0.0.5', '1', '10.0.1.4-10.0.1.6', '2-4', 'ALLOW'],
+		['IN', 'TCP', '1', '10.0.0.0-10.0.0.1', '1', '10.0.1.2-10.0.1.3', '2-4', 'DENY'],
+		['IN', 'TCP', '1', '10.0.0.6-10.0.0.7', '1', '10.0.1.2-10.0.1.3', '2-4', 'DENY'],
+		['IN', 'TCP', '1', '10.0.0.2-10.0.0.5', '1', '10.0.1.2-10.0.1.3', '2-4', 'DENY'],
+	]
+
+	def test_every_hash_seed_gives_the_expected_rules(self):
 		# Issue #6: the split order used to follow a set's iteration order,
 		# which changes with PYTHONHASHSEED. These two rules differ in three
-		# split attributes, and seeds 0, 1 and 3 gave three different results.
-		# The seed is fixed when Python starts, so each one needs its own
-		# process.
-		code = ("from anomaly_resolver import AnomalyResolver, Rule\n"
+		# split attributes. On master, seeds 0, 1 and 3 each gave a different
+		# result, and seed 4 gave the same result as seed 3. The seed is fixed
+		# when Python starts, so each seed runs in its own process, and every
+		# run must give exactly the expected rules.
+		code = ("import json\n"
+			"from anomaly_resolver import AnomalyResolver, Rule\n"
 			"rules = [Rule(in_port='1', tp_src='1', nw_src='10.0.0.0-10.0.0.7',\n"
 			"    nw_dst='10.0.1.0-10.0.1.3', tp_dst='1-4', actions='DENY'),\n"
 			"  Rule(in_port='1', tp_src='1', nw_src='10.0.0.2-10.0.0.5',\n"
 			"    nw_dst='10.0.1.2-10.0.1.6', tp_dst='2-6', actions='ALLOW')]\n"
-			"for rule in AnomalyResolver(log_level='CRITICAL').resolve_anomalies(rules):\n"
-			"    print(rule)\n")
+			"resolved = AnomalyResolver(log_level='CRITICAL').resolve_anomalies(rules)\n"
+			"print(json.dumps([[getattr(rule, field) for field in %r] for rule in resolved]))\n"
+			% (self.FIELDS,))
 		root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-		outputs = set()
 		for seed in ['0', '1', '3', '4']:
-			environment = dict(os.environ, PYTHONHASHSEED=seed, PYTHONDONTWRITEBYTECODE='1')
-			outputs.add(subprocess.run([sys.executable, '-c', code], cwd=root, env=environment,
-				capture_output=True, text=True, check=True).stdout)
-		self.assertEqual(len(outputs), 1, outputs)
+			with self.subTest(seed=seed):
+				environment = dict(os.environ, PYTHONHASHSEED=seed, PYTHONDONTWRITEBYTECODE='1')
+				result = subprocess.run([sys.executable, '-c', code], cwd=root, env=environment,
+					capture_output=True, text=True, timeout=60)
+				self.assertEqual(result.returncode, 0, result.stderr)
+				self.assertEqual(json.loads(result.stdout), self.EXPECTED)
+
+
+class ReadmeTests(unittest.TestCase):
+
+	def test_resolve_example_matches_the_resolved_rules(self):
+		# The README shows the resolved rules for rules/example_rules_1 as the
+		# exact output of --resolve, so it must change whenever that output does.
+		root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+		with open(os.path.join(root, 'README.md'), encoding='utf-8') as handle:
+			example = handle.read().split('After anomaly resolving')[1].split('```')[1]
+		resolver = AnomalyResolver(log_level='CRITICAL')
+		self.addCleanup(resolver.resolver_logger.handlers.clear)
+		rules = SimpleRuleParser(os.path.join(root, 'rules', 'example_rules_1')).rules
+		self.assertEqual([line.strip() for line in example.splitlines() if line.strip()],
+			[str(rule) for rule in resolver.resolve_anomalies(rules)])
 
 
 class ConflictResolutionTests(unittest.TestCase):

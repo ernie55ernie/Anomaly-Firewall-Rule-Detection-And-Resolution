@@ -101,7 +101,7 @@ Any other value is rejected with an error that names the line.
 10. <IN, UDP, 129.110.96.117, ANY, 129.110.96.117, 22, REJECT>
 11. <OUT, UDP, ANY, ANY, ANY, ANY, REJECT>
 ```
-After anomaly resolving, the list is free from anomalies. This is the output of `python main.py --path rules/example_rules_1 --resolve`, which is the same on every run:
+After anomaly resolving, the list is free from anomalies as the paper defines them. This is the output of `python main.py --path rules/example_rules_1 --resolve`, which is the same on every run:
 ```
         <IN, TCP, 129.110.96.117, *, 0.0.0.0-129.110.96.79, 80, DENY>
         <IN, TCP, 129.110.96.117, *, 129.110.96.81-255.255.255.255, 80, DENY>
@@ -115,6 +115,7 @@ After anomaly resolving, the list is free from anomalies. This is the output of 
         <IN, UDP, 129.110.96.117, *, 129.110.96.0/24, 22, DENY>
         <OUT, UDP, *, *, *, *, DENY>
 ```
+Running `--detect` on this list still reports two "Shadowing Anomaly" entries: the first and second rules, for host `129.110.96.117`, each come before the matching broader `129.110.96.0/24` rule, with a different action. A specific rule placed before a broader one like this is what the paper calls a generalization, which is not an anomaly. `--detect` reports it as shadowing because it doesn't yet take rule order into account (see [Known Issues](#known-issues)).
 
 ## Illustrative Example of the Merge Algorithm
 ```

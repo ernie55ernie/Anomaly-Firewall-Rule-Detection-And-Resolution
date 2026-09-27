@@ -117,6 +117,8 @@ After anomaly resolving, the list is free from anomalies as the paper defines th
 ```
 Running `--detect` on this list still reports two "Shadowing Anomaly" entries: the first and second rules, for host `129.110.96.117`, each come before the matching broader `129.110.96.0/24` rule, with a different action. A specific rule placed before a broader one like this is what the paper calls a generalization, which is not an anomaly. `--detect` reports it as shadowing because it doesn't yet take rule order into account (see [Known Issues](#known-issues)).
 
+Rules built in code can also name a switch or a VLAN. The rules file has neither, so parsed rules apply to `all`. As in Ryu, a rule for `all` applies on every switch and for every VLAN. Resolution handles each named switch and VLAN separately, with the rules for `all` added, and then the rules for `all` on their own for the switches and VLANs that no rule names. The output lists the more specific rules first, so each named switch is decided by its own resolved rules. Copies of rules for `all` are removed where a later rule makes them redundant.
+
 ## Illustrative Example of the Merge Algorithm
 ```
 1. <IN, TCP, 202.80.169.29-63, 483, 129.110.96.64-127, 100-110, ACCEPT>
@@ -162,7 +164,7 @@ None are open. Fixed since the audit:
 - Running `--merge` or `python anomaly_resolver.py` from the repository root overwrites the committed images in `img/`.
 - `main.py` prints a raw traceback for a missing file or a parse error.
 - `Rule` subclasses `ctypes.Structure`. Assigning an int to a string field (`rule.tp_dst = 80`) crashes the interpreter, and rules can't be copied, pickled or put in sets.
-- `switch` or `vlan` set to `'all'` is treated as disjoint from a specific value. ICMP rules that have ports are treated as port-specific. A rules file with a UTF-8 BOM is rejected.
+- ICMP rules that have ports are treated as port-specific. A rules file with a UTF-8 BOM is rejected.
 - Plotting switches the global matplotlib backend and uses a predictable shared temp directory.
 - `requirements.txt` needs Python 3.11 or later, which isn't documented, and lists `pydot`, which is never used.
 - This README: the Usage block is out of date, the Ryu firewall link in [Relation Between Two Rules](#relation-between-two-rules) is broken, and the blog post link returns 404.

@@ -116,7 +116,7 @@ class Rule(ctypes.Structure):
 	def __init__(self, switch = 'all', vlan = 'all', priority = 0, \
 		in_port = '*', dl_src = '*', dl_dst = '*', \
 		dl_type = 'IPv4', nw_src = '*', nw_dst = '*', ipv6_src = '*', \
-		ipv6_dst = '*', nw_proto = 'TCP', tp_src = '0-65535', \
+		ipv6_dst = '*', nw_proto = None, tp_src = '0-65535', \
 		tp_dst = '*', direction = 'IN', actions = 'DENY', id = 0, rule_id=0):
 
 		priority = Rule._sanity_check(priority, field = 'priority')
@@ -128,7 +128,14 @@ class Rule(ctypes.Structure):
 		ipv6_dst = Rule._sanity_check(ipv6_dst, field = 'ipv6')
 		nw_src = Rule._sanity_check(nw_src, field = 'ipv4')
 		nw_dst = Rule._sanity_check(nw_dst, field = 'ipv4')
-		nw_proto = Rule._sanity_check(nw_proto, field = 'nw_proto')
+		# ARP packets carry no IP protocol, so an ARP rule's nw_proto is '*'
+		# when not given. Other rules default to TCP, and need a protocol.
+		if dl_type == 'ARP' and (nw_proto is None or
+				(isinstance(nw_proto, str) and nw_proto.upper() in ('*', 'ANY'))):
+			nw_proto = '*'
+		else:
+			nw_proto = Rule._sanity_check('TCP' if nw_proto is None else nw_proto,
+				field = 'nw_proto')
 		tp_src = Rule._sanity_check(tp_src, field = 'port')
 		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
 		direction = Rule._sanity_check(direction, field = 'direction')
@@ -156,6 +163,13 @@ class Rule(ctypes.Structure):
 				raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
 		if protocol_family and dl_type != protocol_family:
 			raise ValueError('nw_proto %s needs dl_type %s, not %s' % (nw_proto, protocol_family, dl_type))
+		# An ARP rule with an IP protocol or a port could match nothing.
+		if dl_type == 'ARP':
+			if nw_proto != '*':
+				raise ValueError("An ARP rule can't have an IP protocol: nw_proto %s" % (nw_proto,))
+			for field, value in [('tp_src', tp_src), ('tp_dst', tp_dst)]:
+				if value != '*':
+					raise ValueError("An ARP rule can't have ports: %s %r" % (field, value))
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \

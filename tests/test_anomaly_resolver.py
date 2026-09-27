@@ -1689,16 +1689,18 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 			return first, generator.randint(first, high)
 
 		def random_rule():
-			# IPv6 addresses only on IPv6 rules: an ARP rule can't have one.
+			# IPv6 addresses and ports only on IPv6 rules: an ARP rule can't
+			# have either.
 			source, port = random_range(0, 4), random_range(1, 3)
 			dl_type = generator.choice(['IPv6', 'IPv6', 'ARP'])
 			ipv6_src = generator.choice(['*', '::/126', '::4-::7']) if generator.random() < 0.3 \
 				else '::%x-::%x' % source
+			tp_dst = '*' if generator.random() < 0.15 else '%d-%d' % port
 			return Rule(dl_type=dl_type,
 				dl_src=generator.choice(macs['dl_src'][:2] + ['*', '*']),
 				dl_dst=generator.choice(macs['dl_dst'][:1] + ['*', '*']),
 				ipv6_src=ipv6_src if dl_type == 'IPv6' else '*',
-				tp_dst='*' if generator.random() < 0.15 else '%d-%d' % port,
+				tp_dst=tp_dst if dl_type == 'IPv6' else '*',
 				actions=generator.choice(['ALLOW', 'DENY']))
 
 		def fields(rule):
@@ -1750,6 +1752,69 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 		# every address often match the same packet.
 		self.assertGreater(outcomes['ipv6 split'], 20, outcomes)
 		self.assertGreater(outcomes['mixed macs'], 200, outcomes)
+
+
+class ArpTests(unittest.TestCase):
+	# Issue #36: ARP packets carry no IP protocol and no ports, but every rule
+	# had nw_proto TCP and ports, so ARP rules that differ only in those
+	# counted as disjoint, although both match every ARP packet.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def test_arp_rules_have_no_protocol_or_ports(self):
+		rule = Rule(dl_type='ARP', actions='ALLOW')
+		self.assertEqual((rule.nw_proto, rule.tp_src, rule.tp_dst), ('*', '*', '*'))
+		self.assertEqual(str(rule), '<IN, *, *, *, *, *, ALLOW>')
+		for value in ['*', 'ANY', 'any']:
+			with self.subTest(nw_proto=value):
+				self.assertEqual(Rule(dl_type='ARP', nw_proto=value).nw_proto, '*')
+		# Other rules keep TCP as the default, and '*' is still not a protocol.
+		self.assertEqual(Rule().nw_proto, 'TCP')
+		self.assertEqual(Rule(dl_type='IPv6').nw_proto, 'TCP')
+		for dl_type in ['IPv4', 'IPv6']:
+			with self.subTest(dl_type=dl_type):
+				with self.assertRaisesRegex(ValueError, 'Invalid protocol'):
+					Rule(dl_type=dl_type, nw_proto='*')
+
+	def test_protocols_and_ports_on_arp_rules_are_rejected(self):
+		for fields, parts in [(dict(nw_proto='TCP'), ['ARP rule', 'IP protocol', 'TCP']),
+				(dict(nw_proto='udp'), ['ARP rule', 'IP protocol', 'UDP']),
+				(dict(tp_dst='80'), ['ARP rule', 'ports', "tp_dst '80'"]),
+				(dict(tp_src='1024-65535'), ['ARP rule', 'ports', "tp_src '1024-65535'"]),
+				(dict(nw_proto='ICMP'), ['ICMP needs dl_type IPv4, not ARP'])]:
+			with self.subTest(fields=fields):
+				with self.assertRaises(ValueError) as error:
+					Rule(dl_type='ARP', **fields)
+				for part in parts:
+					self.assertIn(part, str(error.exception))
+
+	def test_equivalent_arp_rules_overlap(self):
+		# The issue's rules can't be built any more. Without a protocol, two
+		# ARP rules with opposite actions match the same packets: detection
+		# reports it, and resolution keeps one rule, which denies.
+		with self.assertRaises(ValueError):
+			Rule(dl_type='ARP', nw_proto='UDP', actions='ALLOW')
+		with self.assertRaises(ValueError):
+			Rule(dl_type='ARP', tp_dst='80', actions='ALLOW')
+		allow = Rule(dl_type='ARP', actions='ALLOW')
+		deny = Rule(dl_type='ARP', actions='DENY')
+		self.assertFalse(allow.disjoint(deny))
+		self.assertTrue(allow.issubset(deny) and deny.issubset(allow))
+		with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+			self.resolver.detect_anomalies([allow, deny])
+		self.assertIn('Shadowing Anomaly\n\t%s\n\t%s' % (allow, deny),
+			[record.getMessage() for record in logs.records])
+		resolved = self.resolver.resolve_anomalies([allow, deny])
+		self.assertEqual([(rule.dl_type, rule.nw_proto, rule.actions) for rule in resolved],
+			[('ARP', '*', 'DENY')])
+		# ARP rules still differ by MAC address, and never overlap IP rules.
+		self.assertTrue(Rule(dl_type='ARP', dl_src='aa:aa:aa:aa:aa:aa').disjoint(
+			Rule(dl_type='ARP', dl_src='bb:bb:bb:bb:bb:bb')))
+		self.assertTrue(allow.disjoint(Rule(actions='DENY')))
 
 
 def product_scopes(rules):

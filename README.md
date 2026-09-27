@@ -122,7 +122,8 @@ Rules built in code can also name a switch or a VLAN. The rules file has neither
 In code, `Rule()` also takes an Ethernet type in `dl_type` (`ARP`, `IPv4` or `IPv6`), MAC addresses in `dl_src` and `dl_dst`, and IPv6 addresses in `ipv6_src` and `ipv6_dst`. The rules file has none of these, so parsed rules are IPv4 rules for any MAC or IPv6 address.
 - A MAC address is `*` or six pairs of hex digits separated by colons. It is stored in lower case, so each address has one spelling.
 - An IPv6 value is `*`, an address, a range, or a CIDR block on its network address. It is stored in compressed form, and a zone such as `%eth0` is rejected.
-- IPv4 addresses and `ICMP` need `dl_type` `IPv4`, the default. IPv6 addresses and `ICMPv6` need `dl_type` `IPv6`. A rule that mixes the two families, or whose `dl_type` doesn't match them, could match nothing, so it is rejected. This doesn't cover ARP yet: ARP rules still carry a protocol and ports, which don't apply to ARP ([#36](https://github.com/ernie55ernie/Anomaly-Firewall-Rule-Detection-And-Resolution/issues/36)).
+- IPv4 addresses and `ICMP` need `dl_type` `IPv4`, the default. IPv6 addresses and `ICMPv6` need `dl_type` `IPv6`. A rule that mixes the two families, or whose `dl_type` doesn't match them, could match nothing, so it is rejected.
+- ARP packets carry no IP protocol and no ports, so an ARP rule has neither. Its `nw_proto` and ports are `*`, and giving it a protocol or a port is rejected. Other rules default to `TCP`.
 - Rules for different Ethernet types never overlap.
 - IPv6 ranges are compared and split like IPv4 ranges.
 - MAC addresses are handled like switches: `*` holds every address, and each MAC address that a rule names is resolved separately.

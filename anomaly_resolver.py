@@ -56,14 +56,15 @@ class SimpleRuleParser(RuleParser):
 						% (line_number, len(fields), raw_line.rstrip())
 					)
 				try:
-					# The rules file only has IPv4 addresses, so its rules are for
-					# IPv4, and ICMPv6 runs over IPv6. Say so in terms of the file
-					# rather than of dl_type, which the file can't set.
-					if Rule._sanity_check(fields[1], field = 'nw_proto') == 'ICMPv6':
-						raise ValueError("ICMPv6 needs IPv6 addresses, which this rule format doesn't support")
+					# The file has no Ethernet type, and its addresses are IPv4.
+					# ICMPv6 alone decides the family, since it runs over IPv6
+					# only: without addresses the line is an IPv6 rule, and with
+					# an IPv4 address Rule() reports the conflict.
+					nw_proto = Rule._sanity_check(fields[1], field = 'nw_proto')
 					rule = Rule(priority = priority,
+						dl_type = 'IPv6' if nw_proto == 'ICMPv6' else 'IPv4',
 						direction = fields[0],
-						nw_proto = fields[1],
+						nw_proto = nw_proto,
 						nw_src = fields[2],
 						nw_dst = fields[4],
 						tp_src = fields[3],
@@ -133,17 +134,28 @@ class Rule(ctypes.Structure):
 		direction = Rule._sanity_check(direction, field = 'direction')
 		actions = Rule._sanity_check(actions, field = 'action')
 		# IPv4 addresses and ICMP only match IPv4 packets, and IPv6 addresses
-		# and ICMPv6 only IPv6 packets, so any other combination is a rule
-		# that matches nothing. dl_type defaults to IPv4, so an IPv6 address
-		# or ICMPv6 needs dl_type='IPv6'.
-		for family, fields in [('IPv4', {'nw_src': nw_src, 'nw_dst': nw_dst}),
-				('IPv6', {'ipv6_src': ipv6_src, 'ipv6_dst': ipv6_dst})]:
-			for field, value in fields.items():
-				if value != '*' and dl_type != family:
-					raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
-		family = {'ICMP': 'IPv4', 'ICMPv6': 'IPv6'}.get(nw_proto, dl_type)
-		if dl_type != family:
-			raise ValueError('nw_proto %s needs dl_type %s, not %s' % (nw_proto, family, dl_type))
+		# and ICMPv6 only IPv6 packets, so a rule that mixes them, or whose
+		# dl_type is another family, matches nothing. A mix is reported as
+		# such, since no dl_type would fix it. dl_type defaults to IPv4, so an
+		# IPv6 address or ICMPv6 needs dl_type='IPv6'.
+		# 'side' rather than 'direction', which is this rule's IN or OUT.
+		addresses = [(family, side, field, value) for family, side, field, value in [
+			('IPv4', 'source', 'nw_src', nw_src), ('IPv4', 'destination', 'nw_dst', nw_dst),
+			('IPv6', 'source', 'ipv6_src', ipv6_src), ('IPv6', 'destination', 'ipv6_dst', ipv6_dst)]
+			if value != '*']
+		protocol_family = {'ICMP': 'IPv4', 'ICMPv6': 'IPv6'}.get(nw_proto)
+		for family, side, field, value in addresses:
+			if protocol_family and family != protocol_family:
+				raise ValueError("%s rule can't contain the %s %s address %r"
+					% (nw_proto, family, side, value))
+		if len(set(family for family, _, _, _ in addresses)) > 1:
+			raise ValueError("A rule can't contain both IPv4 and IPv6 addresses: %s" % ', '.join(
+				'%s %r' % (field, value) for _, _, field, value in addresses))
+		for family, _, field, value in addresses:
+			if dl_type != family:
+				raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
+		if protocol_family and dl_type != protocol_family:
+			raise ValueError('nw_proto %s needs dl_type %s, not %s' % (nw_proto, protocol_family, dl_type))
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \

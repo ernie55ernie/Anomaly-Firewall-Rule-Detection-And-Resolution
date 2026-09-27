@@ -579,19 +579,49 @@ class ParserTests(unittest.TestCase):
 					self.parse(line)
 				self.assertIn('Invalid %s on line 1' % bad_value, str(error.exception))
 
-	def test_icmpv6_line_is_rejected(self):
-		# Issue #15: the rules file only has IPv4 addresses, so its rules are
-		# for IPv4 packets, and ICMPv6 runs over IPv6. The line became a rule
-		# that matches nothing, without a warning.
-		for protocol in ['ICMPv6', 'icmpv6']:
-			with self.subTest(protocol=protocol):
+	def test_icmpv6_lines_are_ipv6_rules(self):
+		# Issue #15: the file's addresses are IPv4, and ICMPv6 runs over IPv6,
+		# so an ICMPv6 line was an IPv4 rule that matched nothing. Without
+		# addresses, the protocol alone decides the family: the line is an
+		# IPv6 rule. With an IPv4 address it can't match anything, and is
+		# rejected with the conflict named.
+		for line in ['1. <IN, ICMPv6, ANY, ANY, ANY, ANY, ACCEPT>', '1. <IN, icmpv6, any, *, *, ANY, ACCEPT>']:
+			with self.subTest(line=line):
+				rule = self.parse(line)[0]
+				self.assertEqual((rule.dl_type, rule.nw_proto, rule.nw_src, rule.nw_dst, rule.actions),
+					('IPv6', 'ICMPv6', '*', '*', 'ALLOW'))
+		for line, direction in [('1. <IN, ICMPv6, 10.0.0.1, ANY, ANY, ANY, ACCEPT>', 'source'),
+				('1. <IN, ICMPv6, ANY, ANY, 10.0.1.0/24, ANY, ACCEPT>', 'destination')]:
+			with self.subTest(line=line):
 				with self.assertRaises(ValueError) as error:
-					self.parse('1. <IN, %s, 10.0.0.1, ANY, ANY, ANY, ACCEPT>' % protocol,
-						'2. <IN, TCP, 10.0.0.1, ANY, ANY, ANY, REJECT>')
-				self.assertIn("ICMPv6 needs IPv6 addresses, which this rule format doesn't support "
-					'on line 1', str(error.exception))
-		rules = self.parse('1. <IN, ICMP, 10.0.0.1, ANY, ANY, ANY, ACCEPT>')
-		self.assertEqual((rules[0].nw_proto, rules[0].dl_type), ('ICMP', 'IPv4'))
+					self.parse(line, '2. <IN, TCP, 10.0.0.1, ANY, ANY, ANY, REJECT>')
+				message = str(error.exception)
+				self.assertIn('ICMPv6 rule', message)
+				self.assertIn('IPv4 %s address' % direction, message)
+				self.assertIn('on line 1', message)
+		for line, expected in [('1. <IN, ICMP, 10.0.0.1, ANY, ANY, ANY, ACCEPT>', ('IPv4', 'ICMP', '10.0.0.1')),
+				('1. <IN, TCP, 10.0.0.1, ANY, ANY, 80, REJECT>', ('IPv4', 'TCP', '10.0.0.1'))]:
+			with self.subTest(line=line):
+				rule = self.parse(line)[0]
+				self.assertEqual((rule.dl_type, rule.nw_proto, rule.nw_src), expected)
+
+	def test_address_free_icmpv6_rule_is_detected_and_resolved_as_ipv6(self):
+		# The ICMPv6 rule matches IPv6 packets only, so it doesn't overlap the
+		# IPv4 ICMP rule, but a later ICMPv6 rule shadows it.
+		resolver = AnomalyResolver(log_level='CRITICAL')
+		self.addCleanup(resolver.resolver_logger.handlers.clear)
+		icmpv6, icmp = self.parse('1. <IN, ICMPv6, ANY, ANY, ANY, ANY, ACCEPT>',
+			'2. <IN, ICMP, ANY, ANY, ANY, ANY, REJECT>')
+		self.assertTrue(icmpv6.disjoint(icmp))
+		resolved = resolver.resolve_anomalies([icmpv6, icmp])
+		self.assertEqual(first_match(resolved, Rule(dl_type='IPv6', nw_proto='ICMPv6')), 'ALLOW')
+		self.assertEqual(first_match(resolved, Rule(nw_proto='ICMP', nw_src='10.0.0.1')), 'DENY')
+		self.assertIsNone(first_match(resolved, Rule(nw_proto='TCP')))
+		later_icmpv6 = self.parse('3. <IN, ICMPv6, ANY, ANY, ANY, ANY, REJECT>')[0]
+		with self.assertLogs(resolver.resolver_logger, 'INFO') as logs:
+			resolver.detect_anomalies([icmpv6, icmp, later_icmpv6])
+		reports = [record.getMessage() for record in logs.records if 'Anomaly' in record.getMessage()]
+		self.assertEqual(reports, ['Shadowing Anomaly\n\t%s\n\t%s' % (icmpv6, later_icmpv6)])
 
 	def test_priority_must_be_ascii_digits(self):
 		for priority in ['٥', '1_0', '+1', '-1']:
@@ -1520,13 +1550,17 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 		# IPv4 addresses match only IPv4 packets, and IPv6 addresses only IPv6
 		# ones, so any other combination could match nothing. dl_type defaults
 		# to IPv4.
-		rejected = [dict(ipv6_src='2001:db8::1'), dict(ipv6_dst='2001:db8::/32'),
-			dict(dl_type='IPv4', ipv6_src='2001:db8::1'), dict(dl_type='IPv4', ipv6_dst='2001:db8::1'),
-			dict(dl_type='IPv6', nw_src='10.0.0.1'), dict(dl_type='IPv6', nw_dst='10.0.0.0/24'),
-			dict(dl_type='ARP', nw_src='10.0.0.1'), dict(dl_type='ARP', ipv6_dst='2001:db8::1')]
-		for fields in rejected:
+		rejected = [(dict(ipv6_src='2001:db8::1'), 'ipv6_src .* needs dl_type IPv6, not IPv4'),
+			(dict(ipv6_dst='2001:db8::/32'), 'ipv6_dst .* needs dl_type IPv6, not IPv4'),
+			(dict(dl_type='IPv4', ipv6_src='2001:db8::1'), 'ipv6_src .* needs dl_type IPv6, not IPv4'),
+			(dict(dl_type='IPv4', ipv6_dst='2001:db8::1'), 'ipv6_dst .* needs dl_type IPv6, not IPv4'),
+			(dict(dl_type='IPv6', nw_src='10.0.0.1'), 'nw_src .* needs dl_type IPv4, not IPv6'),
+			(dict(dl_type='IPv6', nw_dst='10.0.0.0/24'), 'nw_dst .* needs dl_type IPv4, not IPv6'),
+			(dict(dl_type='ARP', nw_src='10.0.0.1'), 'nw_src .* needs dl_type IPv4, not ARP'),
+			(dict(dl_type='ARP', ipv6_dst='2001:db8::1'), 'ipv6_dst .* needs dl_type IPv6, not ARP')]
+		for fields, message in rejected:
 			with self.subTest(fields=fields):
-				with self.assertRaises(ValueError):
+				with self.assertRaisesRegex(ValueError, message):
 					Rule(**fields)
 		accepted = [dict(nw_src='10.0.0.1', nw_dst='10.0.1.0/24'),
 			dict(dl_type='IPv4', nw_src='10.0.0.1', nw_dst='10.0.1.1'),
@@ -1540,17 +1574,39 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 	def test_icmp_version_must_match_dl_type(self):
 		# ICMP runs over IPv4 and ICMPv6 over IPv6, so any other combination
 		# matches nothing. TCP and UDP run over both.
-		for fields in [dict(nw_proto='ICMPv6'), dict(dl_type='IPv4', nw_proto='ICMPv6'),
-				dict(dl_type='IPv6', nw_proto='ICMP'), dict(dl_type='ARP', nw_proto='ICMP'),
-				dict(dl_type='ARP', nw_proto='ICMPv6')]:
+		for fields, message in [(dict(nw_proto='ICMPv6'), 'ICMPv6 needs dl_type IPv6, not IPv4'),
+				(dict(dl_type='IPv4', nw_proto='ICMPv6'), 'ICMPv6 needs dl_type IPv6, not IPv4'),
+				(dict(dl_type='IPv6', nw_proto='ICMP'), 'ICMP needs dl_type IPv4, not IPv6'),
+				(dict(dl_type='ARP', nw_proto='ICMP'), 'ICMP needs dl_type IPv4, not ARP'),
+				(dict(dl_type='ARP', nw_proto='ICMPv6'), 'ICMPv6 needs dl_type IPv6, not ARP')]:
 			with self.subTest(fields=fields):
-				with self.assertRaises(ValueError):
+				with self.assertRaisesRegex(ValueError, message):
 					Rule(**fields)
 		for fields, expected in [(dict(dl_type='IPv6', nw_proto='icmpv6'), 'ICMPv6'),
 				(dict(nw_proto='icmp'), 'ICMP'), (dict(dl_type='IPv4', nw_proto='ICMP'), 'ICMP'),
 				(dict(dl_type='IPv6', nw_proto='UDP'), 'UDP'), (dict(dl_type='IPv6', nw_proto='TCP'), 'TCP')]:
 			with self.subTest(fields=fields):
 				self.assertEqual(Rule(**fields).nw_proto, expected)
+
+	def test_conflicting_families_are_named_whatever_the_dl_type(self):
+		# ICMPv6 with an IPv4 address, or IPv4 with IPv6 addresses, fits no
+		# dl_type. The error names the conflict, the same for every dl_type,
+		# rather than suggesting a dl_type that another check then rejects.
+		for fields, parts in [(dict(nw_proto='ICMPv6', nw_src='10.0.0.1'), ['ICMPv6 rule', 'IPv4 source']),
+				(dict(nw_proto='ICMPv6', nw_dst='10.0.0.0/24'), ['ICMPv6 rule', 'IPv4 destination']),
+				(dict(nw_proto='ICMP', ipv6_src='2001:db8::1'), ['ICMP rule', 'IPv6 source']),
+				(dict(nw_src='10.0.0.1', ipv6_dst='2001:db8::1'), ['both IPv4 and IPv6'])]:
+			messages = set()
+			for dl_type in ['IPv4', 'IPv6', 'ARP']:
+				with self.subTest(fields=fields, dl_type=dl_type):
+					with self.assertRaises(ValueError) as error:
+						Rule(dl_type=dl_type, **fields)
+					messages.add(str(error.exception))
+			self.assertEqual(len(messages), 1, messages)
+			message = messages.pop()
+			self.assertNotIn('dl_type', message)
+			for part in parts:
+				self.assertIn(part, message)
 
 	def test_rules_with_the_wrong_address_family_cannot_be_built(self):
 		# An IPv6 source on the default IPv4 rule counted as disjoint from the

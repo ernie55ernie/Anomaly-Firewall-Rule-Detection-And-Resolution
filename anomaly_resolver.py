@@ -141,6 +141,8 @@ class Rule(ctypes.Structure):
 			if nw_proto == '*' and dl_type != 'ARP':
 				raise ValueError('Invalid protocol value %r: only an ARP rule has no protocol'
 					% (given,))
+		# Errors about ports quote them as given: '080' rather than '80'.
+		ports_given = {'tp_src': tp_src, 'tp_dst': tp_dst}
 		tp_src = Rule._sanity_check(tp_src, field = 'port')
 		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
 		direction = Rule._sanity_check(direction, field = 'direction')
@@ -168,13 +170,19 @@ class Rule(ctypes.Structure):
 				raise ValueError('%s %r needs dl_type %s, not %s' % (field, value, family, dl_type))
 		if protocol_family and dl_type != protocol_family:
 			raise ValueError('nw_proto %s needs dl_type %s, not %s' % (nw_proto, protocol_family, dl_type))
-		# An ARP rule with an IP protocol or a port could match nothing.
-		if dl_type == 'ARP':
-			if nw_proto != '*':
-				raise ValueError("An ARP rule can't have an IP protocol: nw_proto %s" % (nw_proto,))
+		# ARP packets carry no IP protocol, so an ARP rule has none. And in
+		# this rule model tp_src and tp_dst are TCP and UDP transport ports:
+		# they don't apply to ICMP, ICMPv6 or ARP, and ICMP type and code
+		# aren't represented through them. A specific port on such a rule is
+		# rejected because the field doesn't apply, not because the rule
+		# would match nothing; '*', ANY and 0-65535 don't constrain it.
+		if dl_type == 'ARP' and nw_proto != '*':
+			raise ValueError("An ARP rule can't have an IP protocol: nw_proto %s" % (nw_proto,))
+		if nw_proto not in ('TCP', 'UDP'):
 			for field, value in [('tp_src', tp_src), ('tp_dst', tp_dst)]:
 				if value != '*':
-					raise ValueError("An ARP rule can't have ports: %s %r" % (field, value))
+					raise ValueError("An %s rule can't have ports: %s %r"
+						% ('ARP' if dl_type == 'ARP' else nw_proto, field, ports_given[field]))
 
 		super(Rule, self).__init__(switch, vlan, priority, in_port, \
 			dl_src, dl_dst, dl_type, nw_src, nw_dst, ipv6_src, ipv6_dst, \

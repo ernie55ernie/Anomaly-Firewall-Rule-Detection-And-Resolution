@@ -13,6 +13,9 @@ import networkx as nx
 from utils import hierarchy_pos
 
 STRING_TYPE = ctypes.c_wchar_p
+# The default of an argument whose absence means something, so that an
+# explicit None still reaches validation and is rejected.
+NOT_GIVEN = object()
 
 class RuleParser():
 	
@@ -64,7 +67,7 @@ class SimpleRuleParser(RuleParser):
 					rule = Rule(priority = priority,
 						dl_type = 'IPv6' if nw_proto == 'ICMPv6' else 'IPv4',
 						direction = fields[0],
-						nw_proto = nw_proto,
+						nw_proto = fields[1],
 						nw_src = fields[2],
 						nw_dst = fields[4],
 						tp_src = fields[3],
@@ -116,7 +119,7 @@ class Rule(ctypes.Structure):
 	def __init__(self, switch = 'all', vlan = 'all', priority = 0, \
 		in_port = '*', dl_src = '*', dl_dst = '*', \
 		dl_type = 'IPv4', nw_src = '*', nw_dst = '*', ipv6_src = '*', \
-		ipv6_dst = '*', nw_proto = None, tp_src = '0-65535', \
+		ipv6_dst = '*', nw_proto = NOT_GIVEN, tp_src = '0-65535', \
 		tp_dst = '*', direction = 'IN', actions = 'DENY', id = 0, rule_id=0):
 
 		priority = Rule._sanity_check(priority, field = 'priority')
@@ -128,14 +131,16 @@ class Rule(ctypes.Structure):
 		ipv6_dst = Rule._sanity_check(ipv6_dst, field = 'ipv6')
 		nw_src = Rule._sanity_check(nw_src, field = 'ipv4')
 		nw_dst = Rule._sanity_check(nw_dst, field = 'ipv4')
-		# ARP packets carry no IP protocol, so an ARP rule's nw_proto is '*'
-		# when not given. Other rules default to TCP, and need a protocol.
-		if dl_type == 'ARP' and (nw_proto is None or
-				(isinstance(nw_proto, str) and nw_proto.upper() in ('*', 'ANY'))):
-			nw_proto = '*'
+		# ARP packets carry no IP protocol, so an omitted nw_proto is '*' for
+		# an ARP rule and TCP for any other. '*' or ANY, the protocol not
+		# constraining the rule, fits ARP rules only; None is an error.
+		if nw_proto is NOT_GIVEN:
+			nw_proto = '*' if dl_type == 'ARP' else 'TCP'
 		else:
-			nw_proto = Rule._sanity_check('TCP' if nw_proto is None else nw_proto,
-				field = 'nw_proto')
+			given, nw_proto = nw_proto, Rule._sanity_check(nw_proto, field = 'nw_proto')
+			if nw_proto == '*' and dl_type != 'ARP':
+				raise ValueError('Invalid protocol value %r: only an ARP rule has no protocol'
+					% (given,))
 		tp_src = Rule._sanity_check(tp_src, field = 'port')
 		tp_dst = Rule._sanity_check(tp_dst, field = 'port')
 		direction = Rule._sanity_check(direction, field = 'direction')
@@ -284,6 +289,10 @@ class Rule(ctypes.Structure):
 			raise ValueError(error)
 
 		if field == 'nw_proto':
+			# '*' or ANY: the protocol doesn't constrain the rule, which Rule()
+			# accepts for ARP rules only.
+			if wildcard:
+				return '*'
 			protocols = {name.upper(): name for name in ['TCP', 'UDP', 'ICMP', 'ICMPv6']}
 			if upper_value in protocols:
 				return protocols[upper_value]

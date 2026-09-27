@@ -609,7 +609,10 @@ class ParserTests(unittest.TestCase):
 		# The ICMPv6 rule matches IPv6 packets only, so it doesn't overlap the
 		# IPv4 ICMP rule, but a later ICMPv6 rule shadows it.
 		resolver = AnomalyResolver(log_level='CRITICAL')
-		self.addCleanup(resolver.resolver_logger.handlers.clear)
+		# Look the list up when cleaning up: assertLogs below puts a copy of it
+		# back on the logger, so clearing the list seen now would leave the
+		# handler, and a later resolver that reuses this id() would get two.
+		self.addCleanup(lambda: resolver.resolver_logger.handlers.clear())
 		icmpv6, icmp = self.parse('1. <IN, ICMPv6, ANY, ANY, ANY, ANY, ACCEPT>',
 			'2. <IN, ICMP, ANY, ANY, ANY, ANY, REJECT>')
 		self.assertTrue(icmpv6.disjoint(icmp))
@@ -622,6 +625,14 @@ class ParserTests(unittest.TestCase):
 			resolver.detect_anomalies([icmpv6, icmp, later_icmpv6])
 		reports = [record.getMessage() for record in logs.records if 'Anomaly' in record.getMessage()]
 		self.assertEqual(reports, ['Shadowing Anomaly\n\t%s\n\t%s' % (icmpv6, later_icmpv6)])
+
+	def test_any_protocol_is_rejected(self):
+		# A rules-file rule is IPv4 or IPv6, and needs a protocol: ANY would
+		# mean it has none, which only an ARP rule can.
+		with self.assertRaises(ValueError) as error:
+			self.parse('1. <IN, ANY, 10.0.0.1, ANY, ANY, ANY, ACCEPT>')
+		self.assertIn("Invalid protocol value 'ANY'", str(error.exception))
+		self.assertIn('on line 1', str(error.exception))
 
 	def test_priority_must_be_ascii_digits(self):
 		for priority in ['٥', '1_0', '+1', '-1']:
@@ -645,7 +656,7 @@ class InputValidationTests(unittest.TestCase):
 				'10.0.0.0/ 24', ' 10.0.0.1', '١٠.0.0.1'],
 			'tp_dst': ['8O', '44E', '0x50', '', '-1', '1-', '70000', '1-70000', '80-20', '1-2-3',
 				'22 23', ' 80', '٨٠', '８０'],
-			'nw_proto': ['ANY', 'SCTP', '', 'ıcmp'],
+			'nw_proto': ['ANY', 'SCTP', '', 'ıcmp', None],
 			'direction': ['INBOUND', '', 'ın'],
 			'actions': ['DROP', '', 'ACC EPT'],
 			'priority': [-1, 65536, '5', True],
@@ -717,6 +728,8 @@ class ResolverTests(unittest.TestCase):
 	def test_resolver_instances_do_not_stack_handlers(self):
 		first = AnomalyResolver(log_level='CRITICAL')
 		second = AnomalyResolver(log_level='CRITICAL')
+		self.addCleanup(first.resolver_logger.handlers.clear)
+		self.addCleanup(second.resolver_logger.handlers.clear)
 		self.assertEqual(len(first.resolver_logger.handlers), 1)
 		self.assertEqual(len(second.resolver_logger.handlers), 1)
 
@@ -1690,15 +1703,18 @@ class LinkLayerAndIpv6Tests(unittest.TestCase):
 
 		def random_rule():
 			# IPv6 addresses and ports only on IPv6 rules: an ARP rule can't
-			# have either.
+			# have either. Every value is still drawn, in the order it always
+			# was, and dropped for ARP rules: a draw skipped or moved would
+			# shift every later one, so Random(13) would stop producing the
+			# policies this test was checked with.
 			source, port = random_range(0, 4), random_range(1, 3)
 			dl_type = generator.choice(['IPv6', 'IPv6', 'ARP'])
 			ipv6_src = generator.choice(['*', '::/126', '::4-::7']) if generator.random() < 0.3 \
 				else '::%x-::%x' % source
+			dl_src = generator.choice(macs['dl_src'][:2] + ['*', '*'])
+			dl_dst = generator.choice(macs['dl_dst'][:1] + ['*', '*'])
 			tp_dst = '*' if generator.random() < 0.15 else '%d-%d' % port
-			return Rule(dl_type=dl_type,
-				dl_src=generator.choice(macs['dl_src'][:2] + ['*', '*']),
-				dl_dst=generator.choice(macs['dl_dst'][:1] + ['*', '*']),
+			return Rule(dl_type=dl_type, dl_src=dl_src, dl_dst=dl_dst,
 				ipv6_src=ipv6_src if dl_type == 'IPv6' else '*',
 				tp_dst=tp_dst if dl_type == 'IPv6' else '*',
 				actions=generator.choice(['ALLOW', 'DENY']))
@@ -1772,13 +1788,36 @@ class ArpTests(unittest.TestCase):
 		for value in ['*', 'ANY', 'any']:
 			with self.subTest(nw_proto=value):
 				self.assertEqual(Rule(dl_type='ARP', nw_proto=value).nw_proto, '*')
+		# Ports that don't constrain the rule are accepted too.
+		rule = Rule(dl_type='ARP', tp_src='0-65535', tp_dst='ANY')
+		self.assertEqual((rule.tp_src, rule.tp_dst), ('*', '*'))
 		# Other rules keep TCP as the default, and '*' is still not a protocol.
 		self.assertEqual(Rule().nw_proto, 'TCP')
 		self.assertEqual(Rule(dl_type='IPv6').nw_proto, 'TCP')
 		for dl_type in ['IPv4', 'IPv6']:
 			with self.subTest(dl_type=dl_type):
-				with self.assertRaisesRegex(ValueError, 'Invalid protocol'):
+				with self.assertRaisesRegex(ValueError, "Invalid protocol value '\\*': only an ARP rule"):
 					Rule(dl_type=dl_type, nw_proto='*')
+
+	def test_explicit_missing_protocol_is_rejected(self):
+		# nw_proto=None is a missing value, not the default: a rule built from
+		# data without a protocol must fail rather than become a TCP rule.
+		for dl_type in ['IPv4', 'IPv6', 'ARP']:
+			with self.subTest(dl_type=dl_type):
+				with self.assertRaisesRegex(ValueError, 'Invalid protocol value None'):
+					Rule(dl_type=dl_type, nw_proto=None)
+		row = {'nw_src': '10.0.0.1', 'actions': 'DENY'}
+		with self.assertRaisesRegex(ValueError, 'Invalid protocol value None'):
+			Rule(nw_src=row['nw_src'], nw_proto=row.get('nw_proto'), actions=row['actions'])
+		# Leaving nw_proto out gives the documented default.
+		self.assertEqual(Rule().nw_proto, 'TCP')
+		self.assertEqual(Rule(dl_type='IPv6').nw_proto, 'TCP')
+		self.assertEqual(Rule(dl_type='ARP').nw_proto, '*')
+		for fields, expected in [(dict(nw_proto='TCP'), 'TCP'), (dict(nw_proto='udp'), 'UDP'),
+				(dict(nw_proto='ICMP'), 'ICMP'), (dict(dl_type='IPv6', nw_proto='ICMPv6'), 'ICMPv6'),
+				(dict(dl_type='ARP', nw_proto='ANY'), '*'), (dict(dl_type='ARP', nw_proto='*'), '*')]:
+			with self.subTest(fields=fields):
+				self.assertEqual(Rule(**fields).nw_proto, expected)
 
 	def test_protocols_and_ports_on_arp_rules_are_rejected(self):
 		for fields, parts in [(dict(nw_proto='TCP'), ['ARP rule', 'IP protocol', 'TCP']),

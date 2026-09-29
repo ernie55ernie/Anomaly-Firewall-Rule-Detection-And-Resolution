@@ -115,6 +115,15 @@ class Rule(ctypes.Structure):
 				('actions', STRING_TYPE)
 				 # REST_ACTION, [ 'ALLOW' | 'DENY' ]
 				]
+	# Bookkeeping for resolve_anomalies, which sets these on the pieces it
+	# cuts. They aren't ctypes fields, so set_fields() doesn't copy them.
+	# _origins holds the indexes, in the list resolve_anomalies was given, of
+	# original rules containing the piece: all of them once complete_origins()
+	# has run. Pieces share these frozensets, so they are replaced, never
+	# changed in place. _has_inner is whether another piece lies inside this
+	# one.
+	_origins = frozenset()
+	_has_inner = False
 
 	def __init__(self, switch = 'all', vlan = 'all', priority = 0, \
 		in_port = '*', dl_src = '*', dl_dst = '*', \
@@ -682,6 +691,8 @@ class AnomalyResolver:
 		'''
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \
 			'\n\t'.join(map(str, old_rules_list)))
+		# Pieces record original rules by their index in this list.
+		old_rules_list = list(old_rules_list)
 		new_rules_list = list()
 		scopes = self.scopes(old_rules_list)
 		for scope in scopes:
@@ -696,13 +707,15 @@ class AnomalyResolver:
 			# written for, decide the action of each piece afterwards: a rule
 			# for one switch is more specific than the same rule for 'all'.
 			pieces = list()
-			for rule in old_rules_list:
+			for index, rule in enumerate(old_rules_list):
 				if self.applies(rule, scope):
 					working_rule = Rule()
 					working_rule.set_fields(rule)
 					for (field, _), value in zip(self.scope_fields, scope):
 						setattr(working_rule, field, value)
+					working_rule._origins = frozenset([index])
 					self.insert(working_rule, pieces)
+			self.complete_origins(pieces, old_rules_list)
 			self.set_actions(pieces, old_rules_list)
 			new_rules_list.extend(pieces)
 		new_rules_list = self.remove_redundant_rules(new_rules_list)
@@ -773,21 +786,53 @@ class AnomalyResolver:
 			for everything, value in zip(wildcards, scope)),
 			[rank(value, everything) for everything, value in zip(wildcards, scope)]))
 
+	@staticmethod
+	def complete_origins(rules_list, original_rules):
+		'''
+		Record in each rule every original rule containing it
+		'''
+		# resolve() and split() pass a piece's origins only to pieces inside or
+		# equal to it, so the origins they record are right, but they can miss
+		# one. Pieces that overlap are nested, the inner one first; every
+		# packet of an original rule stays on a piece that records the rule;
+		# and a piece records every origin of the pieces containing it. So a
+		# piece misses an original rule containing it only when pieces inside
+		# it that record the rule cover all of it. No packet reaches such a
+		# piece, but remove_redundant_rules reads its action. The piece has
+		# _has_inner set, and every original rule containing it contains the
+		# pieces inside it too. So check the origins of the nearest one, the
+		# first found looking back, which are complete already as the list is
+		# walked in order.
+		for index, rule in enumerate(rules_list):
+			if not rule._has_inner:
+				continue
+			for inner_rule in reversed(rules_list[:index]):
+				if not inner_rule.disjoint(rule):
+					rule._origins |= frozenset(origin for origin in
+						inner_rule._origins - rule._origins
+						if rule.issubset(original_rules[origin]))
+					break
+
 	def set_actions(self, rules_list, original_rules):
 		'''
-		Give each rule the action of the most specific original rules containing it
+		Give each rule the action of the most specific original rules it records
 		'''
 		# insert() decides conflicts between pieces of rules, and a piece can be
 		# inside, equal to or outside another piece when their original rules
 		# are related differently. Decide each piece from the original rules
-		# instead: a rule strictly inside another wins, and among rules that
-		# overlap without either containing the other, DENY wins.
+		# containing it instead, which resolve_anomalies records in _origins.
+		# Each original rule's packets stay on pieces inside it, and pieces
+		# that overlap are nested, the inner one first, so every packet that
+		# reaches a piece matches exactly these rules. A rule strictly inside
+		# another wins, and among rules that overlap without either containing
+		# the other, DENY wins.
 		for rule in rules_list:
-			covering = [original for original in original_rules if rule.issubset(original)]
+			covering = [original_rules[origin] for origin in sorted(rule._origins)]
 			if not covering:
-				# Every piece comes from an original rule, so this is a bug in
-				# insert() or split(), not bad input.
-				raise RuntimeError('No original rule contains %s' % (rule,))
+				# Every piece resolve_anomalies cuts records at least the
+				# original rule it was cut from, so this is a bug there or in
+				# resolve() or split(), or a rule it didn't cut.
+				raise RuntimeError('No original rule recorded for %s' % (rule,))
 			most_specific = [original for original in covering if not any(
 				other.issubset(original) and not original.issubset(other)
 				for other in covering)]
@@ -841,6 +886,7 @@ class AnomalyResolver:
 		'''
 		Insert the rule r into new_rules_list
 		'''
+		has_inner = False
 		if not new_rules_list:
 			new_rules_list.append(r)
 		else:
@@ -851,25 +897,33 @@ class AnomalyResolver:
 					inserted = self.resolve(r, subset_rule, new_rules_list)
 					if inserted:
 						break
+					# resolve() passes over subset_rule only when it lies inside r.
+					has_inner = True
 			if not inserted:
 				new_rules_list.append(r)
+		r._has_inner = has_inner
 
 	def resolve(self, rule, subset_rule, new_rules_list):
 		'''
 		Resolve anomalies between two rules r and s
 		'''
-		# Actions are decided afterwards by set_actions(), so only the
-		# placement of the rules matters here.
+		# Actions are decided afterwards by set_actions(), from the original
+		# rules each piece records, so here only the placement of the pieces
+		# and those records matter.
 		if rule.issubset(subset_rule) and subset_rule.issubset(rule):
 			self.resolver_logger.info('Remove rule %s' % (str(rule),))
+			subset_rule._origins |= rule._origins
 			return True
 		if rule.issubset(subset_rule):
 			self.resolver_logger.info('Reodering %s before %s' % \
 				(str(rule), str(subset_rule)))
+			rule._origins |= subset_rule._origins
+			subset_rule._has_inner = True
 			insert_idx = self.position(new_rules_list, subset_rule)
 			new_rules_list.insert(insert_idx, rule)
 			return True
 		if subset_rule.issubset(rule):
+			subset_rule._origins |= rule._origins
 			return False
 		subset_idx = self.position(new_rules_list, subset_rule)
 		if subset_idx is not None:
@@ -878,6 +932,8 @@ class AnomalyResolver:
 
 		for attribute in attribute_set:
 			self.split(rule, subset_rule, attribute, new_rules_list)
+		# What is left of both rules is their common part.
+		subset_rule._origins |= rule._origins
 		self.insert(subset_rule, new_rules_list)
 		return True
 
@@ -913,21 +969,25 @@ class AnomalyResolver:
 		if rule_start > subset_rule_start:
 			copy_rule = Rule()
 			copy_rule.set_fields(subset_rule)
+			copy_rule._origins = subset_rule._origins
 			copy_rule.set_attribute_range(attribute, left, common_start, -1)
 			self.insert(copy_rule, new_rules_list)
 		elif rule_start < subset_rule_start:
 			copy_rule = Rule()
 			copy_rule.set_fields(rule)
+			copy_rule._origins = rule._origins
 			copy_rule.set_attribute_range(attribute, left, common_start, -1)
 			self.insert(copy_rule, new_rules_list)
 		if rule_end > subset_rule_end:
 			copy_rule = Rule()
 			copy_rule.set_fields(rule)
+			copy_rule._origins = rule._origins
 			copy_rule.set_attribute_range(attribute, common_end, right, 1)
 			self.insert(copy_rule, new_rules_list)
 		elif rule_end < subset_rule_end:
 			copy_rule = Rule()
 			copy_rule.set_fields(subset_rule)
+			copy_rule._origins = subset_rule._origins
 			copy_rule.set_attribute_range(attribute, common_end, right, 1)
 			self.insert(copy_rule, new_rules_list)
 		rule.set_attribute_range(attribute, common_start, common_end, 0)

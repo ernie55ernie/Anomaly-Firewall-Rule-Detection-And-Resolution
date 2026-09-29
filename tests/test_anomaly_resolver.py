@@ -960,9 +960,12 @@ class ConflictResolutionTests(unittest.TestCase):
 		resolved = self.resolver.resolve_anomalies([deny, allow])
 		self.assertEqual([piece.actions for piece in resolved], ['DENY'])
 
-	def test_piece_outside_every_original_rule_raises(self):
-		with self.assertRaisesRegex(RuntimeError, 'No original rule contains'):
-			self.resolver.set_actions([Rule(nw_src='10.0.0.1')], [Rule(nw_src='10.0.0.2')])
+	def test_piece_recording_no_original_rule_raises(self):
+		# set_actions() reads the original rules each piece records, and every
+		# piece resolve_anomalies cuts records at least one. It doesn't search
+		# for them, even when an original rule contains the piece.
+		with self.assertRaisesRegex(RuntimeError, 'No original rule recorded'):
+			self.resolver.set_actions([Rule(nw_src='10.0.0.1')], [Rule(nw_src='10.0.0.0/24')])
 
 	def test_input_rules_are_not_modified(self):
 		policies = [
@@ -1080,6 +1083,162 @@ class ConflictResolutionTests(unittest.TestCase):
 					self.fail('%s gives %s instead of %s for %s -> %s' % (
 						dict((key, packet_values[key][index]) for key, index in zip(packet_values, indexes)),
 						got, decisions[matching_originals], originals, resolved))
+
+
+class OriginTests(unittest.TestCase):
+	# Issue #17: resolve_anomalies records which original rules contain each
+	# piece while it cuts the rules into pieces, and set_actions() reads that
+	# instead of testing each piece against every original rule.
+
+	def setUp(self):
+		self.resolver = AnomalyResolver(log_level='CRITICAL')
+
+	def tearDown(self):
+		self.resolver.resolver_logger.handlers.clear()
+
+	def resolve(self, rules):
+		return [str(rule) for rule in self.resolver.resolve_anomalies(rules)]
+
+	def test_piece_covered_by_the_pieces_before_it_gets_every_original_rule(self):
+		# The first two rules are split into 1-2, 6-8 and 3-5. The third rule
+		# passes 1-2 and 3-5 and is added after them, so no piece it meets
+		# contains it and hands it the first rule. Its piece matches no packet,
+		# but equal rules with different actions are DENY: without
+		# complete_origins() the piece would have the third rule's ALLOW alone
+		# and stay in the output as an ALLOW no packet reaches.
+		rules = [Rule(tp_dst='1-5', actions='DENY'), Rule(tp_dst='3-8', actions='ALLOW'),
+			Rule(tp_dst='1-5', actions='ALLOW')]
+		self.assertEqual(self.resolve(rules),
+			['<IN, TCP, *, *, *, 6-8, ALLOW>', '<IN, TCP, *, *, *, 1-5, DENY>'])
+
+	def test_piece_that_pieces_land_inside_later_gets_every_original_rule(self):
+		# The second rule lands inside the first, as 3-5 before 2-5. The third
+		# rule overlaps 3-5, which is taken out while they are split, and in
+		# the meantime its part 1-2 splits 2-5: the first rule's new piece 3-5
+		# meets nothing of the second rule. The second rule's pieces 4-5 and 3
+		# then land inside it, and a piece takes nothing from the pieces inside
+		# it. It matches no packet, but it needs the second rule's DENY too.
+		rules = [Rule(tp_dst='2-5', actions='ALLOW'), Rule(tp_dst='3-5', actions='DENY'),
+			Rule(tp_dst='1-3', actions='ALLOW')]
+		self.assertEqual(self.resolve(rules), ['<IN, TCP, *, *, *, 1, ALLOW>',
+			'<IN, TCP, *, *, *, 3-5, DENY>', '<IN, TCP, *, *, *, 2, ALLOW>'])
+
+	def test_piece_gets_original_rules_the_nearest_piece_inside_it_lacked(self):
+		# The first two rules overlap and are cut into pieces, three of them
+		# for port 3. The third rule, port 3, passes those three and is added
+		# after them, and the fourth, 2-3, passes every piece inside it and is
+		# added last. A piece takes nothing from the pieces it passes, so
+		# neither gets the second rule, which contains both. The fourth rule's
+		# piece can take it from the third's, the nearest piece inside it, only
+		# once that piece has it, so complete_origins() walks the list in
+		# order. Equal rules with different actions are DENY.
+		rules = [Rule(nw_src='10.0.0.4', tp_dst='3-4'), Rule(tp_dst='2-3'), Rule(tp_dst='3'),
+			Rule(tp_dst='2-3', actions='ALLOW')]
+		self.assertEqual(self.resolve(rules),
+			['<IN, TCP, 10.0.0.4, *, *, 4, DENY>', '<IN, TCP, *, *, *, 2-3, DENY>'])
+
+	def test_every_piece_gets_exactly_the_original_rules_containing_it(self):
+		# Random policies over a few ports, where pieces are often covered by
+		# the pieces before them. Each piece must record exactly the original
+		# rules that Rule.issubset finds, which set_actions() used to search
+		# for. set_actions() decides every packet a piece catches from them, so
+		# each port must also match exactly the original rules that the first
+		# piece containing it records.
+		generator = random.Random(17)
+		test = self
+		completed = []
+
+		def ports(value):
+			first, _, last = value.partition('-')
+			return int(first), int(last or first)
+
+		class Checked(AnomalyResolver):
+			def complete_origins(self, rules_list, original_rules):
+				before = [rule._origins for rule in rules_list]
+				super().complete_origins(rules_list, original_rules)
+				completed.extend(rule for rule, origins in zip(rules_list, before)
+					if rule._origins != origins)
+
+			def set_actions(self, rules_list, original_rules):
+				for rule in rules_list:
+					test.assertEqual(rule._origins, frozenset(index for index, original
+						in enumerate(original_rules) if rule.issubset(original)),
+						'%s in %s' % (rule, original_rules))
+				for port in range(10):
+					first = next((rule for rule in rules_list
+						if ports(rule.tp_dst)[0] <= port <= ports(rule.tp_dst)[1]), None)
+					test.assertEqual(first._origins if first else frozenset(),
+						frozenset(index for index, original in enumerate(original_rules)
+							if ports(original.tp_dst)[0] <= port <= ports(original.tp_dst)[1]),
+						'port %d in %s' % (port, original_rules))
+				super().set_actions(rules_list, original_rules)
+
+		resolver = Checked(log_level='CRITICAL')
+		self.addCleanup(lambda: resolver.resolver_logger.handlers.clear())
+		for _ in range(200):
+			rules = []
+			for _ in range(generator.randint(3, 9)):
+				first = generator.randint(1, 8)
+				last = generator.randint(first, 8)
+				rules.append(Rule(tp_dst='%d-%d' % (first, last),
+					actions=generator.choice(['ALLOW', 'DENY'])))
+			resolver.resolve_anomalies(rules)
+		# Some pieces lacked an original rule until complete_origins().
+		self.assertTrue(completed)
+
+	def test_rules_need_not_come_in_a_list(self):
+		# Pieces record original rules by their index, so resolve_anomalies
+		# reads the rules into a list first, and any iterable still works.
+		rules = [Rule(tp_dst='1-5', actions='DENY'), Rule(tp_dst='3-8', actions='ALLOW')]
+		self.assertEqual(self.resolve(dict(enumerate(rules)).values()), self.resolve(rules))
+
+	def test_set_actions_compares_only_original_rules(self):
+		# set_actions() reads the original rules each piece records instead of
+		# testing the piece against every original rule. It still compares the
+		# rules it reads with each other, to find the most specific.
+		root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+		rules = SimpleRuleParser(os.path.join(root, 'rules', 'example_rules_1')).rules
+		set_actions, issubset = self.resolver.set_actions, Rule.issubset
+		compared = []
+
+		def checked_set_actions(pieces, original_rules):
+			def checked_issubset(rule, other):
+				self.assertFalse(any(rule is piece or other is piece for piece in pieces),
+					'set_actions() compared %s with %s' % (rule, other))
+				compared.append((rule, other))
+				return issubset(rule, other)
+			with mock.patch.object(Rule, 'issubset', checked_issubset):
+				set_actions(pieces, original_rules)
+
+		with mock.patch.object(self.resolver, 'set_actions', checked_set_actions):
+			self.resolver.resolve_anomalies(rules)
+		self.assertTrue(compared)
+
+	def test_few_pieces_are_tested_against_original_rules(self):
+		# set_actions() used to test every piece against every original rule,
+		# 176 tests for the 16 pieces here. Now only complete_origins() tests
+		# pieces against original rules: a piece with a piece inside it,
+		# against the rules that piece records and it lacks.
+		root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+		rules = SimpleRuleParser(os.path.join(root, 'rules', 'example_rules_1')).rules
+		set_actions, issubset = self.resolver.set_actions, Rule.issubset
+		pieces, tested = [], []
+
+		def recording_set_actions(rules_list, original_rules):
+			pieces.extend(rules_list)
+			set_actions(rules_list, original_rules)
+
+		def recording_issubset(rule, other):
+			if any(other is original for original in rules) and \
+				not any(rule is original for original in rules):
+				tested.append(rule)
+			return issubset(rule, other)
+
+		with mock.patch.object(self.resolver, 'set_actions', recording_set_actions), \
+			mock.patch.object(Rule, 'issubset', recording_issubset):
+			self.resolver.resolve_anomalies(rules)
+		self.assertLess(len(tested), len(pieces),
+			'%d tests against original rules for %d pieces' % (len(tested), len(pieces)))
 
 
 class RedundancyRemovalTests(unittest.TestCase):

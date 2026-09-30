@@ -1149,8 +1149,14 @@ class OriginTests(unittest.TestCase):
 		completed = []
 
 		def ports(value):
+			# Rule stores the whole range as '*'.
+			if value == '*':
+				return 0, 65535
 			first, _, last = value.partition('-')
 			return int(first), int(last or first)
+
+		self.assertEqual([ports(value) for value in ('*', '0-65535', '80', '3-5')],
+			[(0, 65535), (0, 65535), (80, 80), (3, 5)])
 
 		class Checked(AnomalyResolver):
 			def complete_origins(self, rules_list, original_rules):
@@ -1186,11 +1192,84 @@ class OriginTests(unittest.TestCase):
 		# Some pieces lacked an original rule until complete_origins().
 		self.assertTrue(completed)
 
-	def test_rules_need_not_come_in_a_list(self):
-		# Pieces record original rules by their index, so resolve_anomalies
-		# reads the rules into a list first, and any iterable still works.
+	def test_rules_can_come_in_any_iterable(self):
+		# resolve_anomalies reads the rules into a list before anything else,
+		# so an iterator or a generator, which can be read only once, gives the
+		# same rules and log lines as a list.
+		rules = [Rule(tp_dst='1-5', actions='DENY'), Rule(tp_dst='3-8', actions='ALLOW'),
+			Rule(switch='1', tp_dst='4', actions='ALLOW')]
+		results = []
+		for given in (rules, iter(rules), (rule for rule in rules)):
+			with self.assertLogs(self.resolver.resolver_logger, 'INFO') as logs:
+				resolved = self.resolver.resolve_anomalies(given)
+			results.append(([rule.__repr__('detail') for rule in resolved],
+				[record.getMessage() for record in logs.records]))
+		self.assertEqual(len(results[0][0]), 4)
+		self.assertEqual(results[1], results[0])
+		self.assertEqual(results[2], results[0])
+
+	def test_resolved_rules_keep_no_origins(self):
+		# The origins index the list resolve_anomalies was given and mean
+		# nothing once it returns, so neither they nor _has_inner stay on the
+		# rules it returns, and the rules it was given never get them.
+		rules = [Rule(tp_dst='1-5', actions='DENY'), Rule(tp_dst='3-8', actions='ALLOW'),
+			Rule(switch='1', tp_dst='4', actions='ALLOW')]
+		resolved = self.resolver.resolve_anomalies(rules)
+		for rule in resolved + rules:
+			self.assertFalse({'_origins', '_has_inner'} & vars(rule).keys(), str(rule))
+
+	def test_rules_already_decided_are_not_decided_again(self):
+		# Resolved rules no longer record their original rules, so deciding
+		# them again fails, rather than reading indexes into a list that may
+		# since have been reordered or cut short and giving wrong actions or
+		# IndexError.
 		rules = [Rule(tp_dst='1-5', actions='DENY'), Rule(tp_dst='3-8', actions='ALLOW')]
-		self.assertEqual(self.resolve(dict(enumerate(rules)).values()), self.resolve(rules))
+		for name, original_rules in [('same', rules), ('reordered', rules[::-1]),
+				('shorter', rules[1:])]:
+			with self.subTest(original_rules=name):
+				resolved = self.resolver.resolve_anomalies(rules)
+				actions = [rule.actions for rule in resolved]
+				with self.assertRaisesRegex(RuntimeError, 'No original rule recorded'):
+					self.resolver.set_actions(resolved, original_rules)
+				self.assertEqual([rule.actions for rule in resolved], actions)
+
+	def test_rule_inserted_by_hand_keeps_its_action(self):
+		# insert() puts the DENY exception inside the resolved ALLOW piece,
+		# which no longer records its original rules. set_actions() fails
+		# instead of giving the exception the ALLOW rule's action.
+		allow = Rule(tp_dst='*', actions='ALLOW')
+		resolved = self.resolver.resolve_anomalies([allow])
+		deny = Rule(tp_dst='1-2', actions='DENY')
+		self.resolver.insert(deny, resolved)
+		self.assertIs(resolved[0], deny)
+		with self.assertRaisesRegex(RuntimeError, 'No original rule recorded'):
+			self.resolver.set_actions(resolved, [allow, deny])
+		self.assertEqual([rule.actions for rule in resolved], ['DENY', 'ALLOW'])
+
+	def test_complete_origins_refuses_a_broken_record(self):
+		# complete_origins() checks what set_actions() relies on, so a piece
+		# that resolve_anomalies didn't cut, or whose record is partial or
+		# empty, raises instead of being decided from part of its original
+		# rules. So does an earlier piece that overlaps a later one without
+		# lying inside it.
+		originals = [Rule(tp_dst='1-5'), Rule(tp_dst='4-8')]
+
+		def piece(tp_dst, **record):
+			rule = Rule(tp_dst=tp_dst)
+			for name, value in record.items():
+				setattr(rule, name, value)
+			return rule
+
+		for name, record in [('none', {}), ('origins alone', {'_origins': frozenset([0])}),
+				('flag alone', {'_has_inner': False}),
+				('no origin', {'_origins': frozenset(), '_has_inner': False})]:
+			with self.subTest(record=name):
+				with self.assertRaisesRegex(RuntimeError, 'No original rule recorded'):
+					AnomalyResolver.complete_origins([piece('1-5', **record)], originals)
+		crossing = piece('4-8', _origins=frozenset([1]), _has_inner=False)
+		outer = piece('1-5', _origins=frozenset([0]), _has_inner=True)
+		with self.assertRaisesRegex(RuntimeError, 'overlaps the later piece'):
+			AnomalyResolver.complete_origins([crossing, outer], originals)
 
 	def test_set_actions_compares_only_original_rules(self):
 		# set_actions() reads the original rules each piece records instead of

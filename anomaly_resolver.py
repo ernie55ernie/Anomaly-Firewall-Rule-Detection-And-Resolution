@@ -116,12 +116,12 @@ class Rule(ctypes.Structure):
 				 # REST_ACTION, [ 'ALLOW' | 'DENY' ]
 				]
 	# Bookkeeping for resolve_anomalies, which sets these on the pieces it
-	# cuts. They aren't ctypes fields, so set_fields() doesn't copy them.
-	# _origins holds the indexes, in the list resolve_anomalies was given, of
-	# original rules containing the piece: all of them once complete_origins()
-	# has run. Pieces share these frozensets, so they are replaced, never
-	# changed in place. _has_inner is whether another piece lies inside this
-	# one.
+	# cuts and drops them once it has set their actions. They aren't ctypes
+	# fields, so set_fields() doesn't copy them. _origins holds the indexes,
+	# in the list resolve_anomalies was given, of original rules containing
+	# the piece: all of them once complete_origins() has run. Pieces share
+	# these frozensets, so they are replaced, never changed in place.
+	# _has_inner is whether another piece lies inside this one.
 	_origins = frozenset()
 	_has_inner = False
 
@@ -689,10 +689,11 @@ class AnomalyResolver:
 		'''
 		Resolve anomalies in firewall rules file
 		'''
+		# Read the rules before anything else: an iterator can be read only
+		# once, and pieces record original rules by their index in this list.
+		old_rules_list = list(old_rules_list)
 		self.resolver_logger.info('Perform Resolving\nOld rules list:\n\t' + \
 			'\n\t'.join(map(str, old_rules_list)))
-		# Pieces record original rules by their index in this list.
-		old_rules_list = list(old_rules_list)
 		new_rules_list = list()
 		scopes = self.scopes(old_rules_list)
 		for scope in scopes:
@@ -717,6 +718,11 @@ class AnomalyResolver:
 					self.insert(working_rule, pieces)
 			self.complete_origins(pieces, old_rules_list)
 			self.set_actions(pieces, old_rules_list)
+			# The origins index old_rules_list and mean nothing once the actions
+			# are set, so drop them rather than leave them for a later call to
+			# trust. complete_origins() checked that every piece has both.
+			for piece in pieces:
+				del piece._origins, piece._has_inner
 			new_rules_list.extend(pieces)
 		new_rules_list = self.remove_redundant_rules(new_rules_list)
 		# TODO reassign priority
@@ -804,10 +810,21 @@ class AnomalyResolver:
 		# first found looking back, which are complete already as the list is
 		# walked in order.
 		for index, rule in enumerate(rules_list):
+			# resolve_anomalies records both on every piece, with at least the
+			# original rule it was cut from. Refuse anything else rather than
+			# decide a piece from part of its original rules.
+			if '_origins' not in vars(rule) or '_has_inner' not in vars(rule) or \
+				not rule._origins:
+				raise RuntimeError('No original rule recorded for %s' % (rule,))
 			if not rule._has_inner:
 				continue
 			for inner_rule in reversed(rules_list[:index]):
 				if not inner_rule.disjoint(rule):
+					# The walk relies on pieces that overlap being nested, the
+					# inner one first. Checking that costs one comparison.
+					if not inner_rule.issubset(rule):
+						raise RuntimeError('Piece %s overlaps the later piece %s '
+							'without lying inside it' % (inner_rule, rule))
 					rule._origins |= frozenset(origin for origin in
 						inner_rule._origins - rule._origins
 						if rule.issubset(original_rules[origin]))
@@ -830,8 +847,8 @@ class AnomalyResolver:
 			covering = [original_rules[origin] for origin in sorted(rule._origins)]
 			if not covering:
 				# Every piece resolve_anomalies cuts records at least the
-				# original rule it was cut from, so this is a bug there or in
-				# resolve() or split(), or a rule it didn't cut.
+				# original rule it was cut from, until its action is set. So
+				# this is a rule it didn't cut or has already decided, or a bug.
 				raise RuntimeError('No original rule recorded for %s' % (rule,))
 			most_specific = [original for original in covering if not any(
 				other.issubset(original) and not original.issubset(other)
